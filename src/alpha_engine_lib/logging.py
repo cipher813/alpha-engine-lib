@@ -57,8 +57,18 @@ def get_flow_doctor():
     return _fd_instance
 
 
-def _attach_flow_doctor(yaml_path: str) -> None:
-    """Initialize the shared flow-doctor instance and attach a log handler."""
+def _attach_flow_doctor(
+    yaml_path: str,
+    exclude_patterns: list[str] | None = None,
+) -> None:
+    """Initialize the shared flow-doctor instance and attach a log handler.
+
+    ``exclude_patterns`` is a list of regex strings forwarded to
+    ``FlowDoctorHandler(exclude_patterns=...)``. Log records whose
+    rendered message matches any pattern are dropped before entering
+    the flow-doctor dispatch pipeline (email / GitHub issue). Use for
+    benign ERROR-level noise that would otherwise dedup-spam on-call.
+    """
     global _fd_instance
     try:
         import flow_doctor
@@ -75,13 +85,17 @@ def _attach_flow_doctor(yaml_path: str) -> None:
         )
 
     _fd_instance = flow_doctor.init(config_path=yaml_path)
-    handler = flow_doctor.FlowDoctorHandler(_fd_instance, level=logging.ERROR)
+    handler_kwargs: dict = {"level": logging.ERROR}
+    if exclude_patterns:
+        handler_kwargs["exclude_patterns"] = exclude_patterns
+    handler = flow_doctor.FlowDoctorHandler(_fd_instance, **handler_kwargs)
     logging.getLogger().addHandler(handler)
 
 
 def setup_logging(
     name: str,
     flow_doctor_yaml: str | None = None,
+    exclude_patterns: list[str] | None = None,
 ) -> None:
     """Configure the root logger for an Alpha Engine entrypoint.
 
@@ -91,6 +105,15 @@ def setup_logging(
     :param flow_doctor_yaml: Absolute or CWD-relative path to the
         flow-doctor yaml config. Required if ``FLOW_DOCTOR_ENABLED=1``;
         ignored otherwise.
+    :param exclude_patterns: Optional list of regex strings. When
+        ``FLOW_DOCTOR_ENABLED=1``, these are forwarded to
+        ``FlowDoctorHandler`` so matching ERROR-level records are
+        dropped before the flow-doctor dispatch pipeline. Use sparingly
+        — this silences *alerts*, not logs. The records still appear in
+        stdout / JSON logs; only flow-doctor's email + GitHub issue
+        routing is suppressed. Example: the executor passes
+        ``[r"Error 10197"]`` to suppress benign IB Gateway noise when
+        the iOS app steals the live-data session.
 
     Env vars consulted:
 
@@ -118,4 +141,4 @@ def setup_logging(
                 "FLOW_DOCTOR_ENABLED=1 but setup_logging() was not given a "
                 "flow_doctor_yaml path"
             )
-        _attach_flow_doctor(flow_doctor_yaml)
+        _attach_flow_doctor(flow_doctor_yaml, exclude_patterns=exclude_patterns)
