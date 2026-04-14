@@ -153,3 +153,47 @@ def test_flow_doctor_enabled_happy_path(monkeypatch, tmp_path):
 
     assert get_flow_doctor() is fake_instance
     fake_module.init.assert_called_once_with(config_path=str(yaml_path))
+    # No exclude_patterns passed → kwarg must be absent so we don't
+    # silently override the FlowDoctorHandler default.
+    _, kwargs = fake_module.FlowDoctorHandler.call_args
+    assert "exclude_patterns" not in kwargs
+
+
+def test_flow_doctor_exclude_patterns_forwarded(monkeypatch, tmp_path):
+    """exclude_patterns reaches FlowDoctorHandler when provided.
+
+    Context (2026-04-14): executor suppresses benign IB Error 10197
+    alerts via this path. The kwarg must pass through unchanged.
+    """
+    monkeypatch.setenv("FLOW_DOCTOR_ENABLED", "1")
+    yaml_path = tmp_path / "flow-doctor.yaml"
+    yaml_path.write_text("flow_name: test\n")
+
+    fake_module = mock.Mock()
+    fake_module.init = mock.Mock(return_value=mock.Mock())
+    fake_module.FlowDoctorHandler = mock.Mock(return_value=logging.NullHandler())
+
+    patterns = [r"Error 10197", r"benign warning"]
+    with mock.patch.dict("sys.modules", {"flow_doctor": fake_module}):
+        setup_logging("test", flow_doctor_yaml=str(yaml_path), exclude_patterns=patterns)
+
+    _, kwargs = fake_module.FlowDoctorHandler.call_args
+    assert kwargs.get("exclude_patterns") == patterns
+
+
+def test_flow_doctor_empty_exclude_patterns_not_forwarded(monkeypatch, tmp_path):
+    """Empty/None exclude_patterns must not set the kwarg — preserves
+    the FlowDoctorHandler default rather than forcing it to ``[]``."""
+    monkeypatch.setenv("FLOW_DOCTOR_ENABLED", "1")
+    yaml_path = tmp_path / "flow-doctor.yaml"
+    yaml_path.write_text("flow_name: test\n")
+
+    fake_module = mock.Mock()
+    fake_module.init = mock.Mock(return_value=mock.Mock())
+    fake_module.FlowDoctorHandler = mock.Mock(return_value=logging.NullHandler())
+
+    with mock.patch.dict("sys.modules", {"flow_doctor": fake_module}):
+        setup_logging("test", flow_doctor_yaml=str(yaml_path), exclude_patterns=[])
+
+    _, kwargs = fake_module.FlowDoctorHandler.call_args
+    assert "exclude_patterns" not in kwargs
