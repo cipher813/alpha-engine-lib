@@ -19,7 +19,8 @@ Stdout markers:
 from __future__ import annotations
 
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta
+from zoneinfo import ZoneInfo
 
 # NYSE observed holidays through 2030.
 # Source: https://www.nyse.com/markets/hours-calendars
@@ -111,6 +112,50 @@ def next_trading_day(d: date | None = None) -> date:
     d = d + timedelta(days=1)
     while not is_trading_day(d):
         d = d + timedelta(days=1)
+    return d
+
+
+# NYSE regular-session close (early-close holidays like the day after
+# Thanksgiving close at 1 PM ET; we keep 4 PM as the conservative
+# threshold — consumers waiting on post-close data should not assume
+# anything before 4 PM ET).
+_NYSE_CLOSE_ET = time(16, 0)
+_NYSE_TZ = ZoneInfo("America/New_York")
+
+
+def last_closed_trading_day(now: datetime | None = None) -> date:
+    """Return the most recent NYSE trading day whose session has actually closed.
+
+    Unified "last closed trading day" semantic for data consumers in
+    both pre-open and post-close contexts:
+
+      - Monday 9 AM ET    → Fri (Monday's session has not closed yet)
+      - Monday 4:30 PM ET → Mon (Monday's session has closed)
+      - Sunday 10 AM ET   → Fri (nothing has closed since Fri)
+      - Tue after MLK Day → Fri before MLK Day (MLK is not a trading day)
+
+    Morning consumers naturally land on the prior trading day (market
+    hasn't closed yet); EOD consumers naturally land on the same day
+    (market has closed). Both consumers ask the same question and get
+    the correct answer without knowing which context they're in.
+
+    Accepts either a naive datetime (assumed in NYSE local time) or a
+    timezone-aware datetime (converted to NYSE time for comparison).
+    Defaults to now in NYSE time.
+    """
+    if now is None:
+        now = datetime.now(_NYSE_TZ)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=_NYSE_TZ)
+    else:
+        now = now.astimezone(_NYSE_TZ)
+
+    today = now.date()
+    if is_trading_day(today) and now.time() >= _NYSE_CLOSE_ET:
+        return today
+    d = today - timedelta(days=1)
+    while not is_trading_day(d):
+        d = d - timedelta(days=1)
     return d
 
 
