@@ -1,0 +1,161 @@
+"""Tests for alpha_engine_lib.arcticdb helpers.
+
+These tests cover URI construction + error-wrapping shapes using
+stubs — they don't require arcticdb to be installed.
+"""
+
+from __future__ import annotations
+
+import sys
+import types
+
+import pytest
+
+from alpha_engine_lib import arcticdb as ae_arctic
+
+
+# ── URI construction ────────────────────────────────────────────────────────
+
+
+def test_arctic_uri_default_region(monkeypatch):
+    monkeypatch.delenv("AWS_REGION", raising=False)
+    uri = ae_arctic.arctic_uri("test-bucket")
+    assert uri == (
+        "s3s://s3.us-east-1.amazonaws.com:test-bucket"
+        "?path_prefix=arcticdb&aws_auth=true"
+    )
+
+
+def test_arctic_uri_region_from_env(monkeypatch):
+    monkeypatch.setenv("AWS_REGION", "eu-west-1")
+    uri = ae_arctic.arctic_uri("test-bucket")
+    assert "s3.eu-west-1.amazonaws.com" in uri
+
+
+def test_arctic_uri_explicit_region_overrides_env(monkeypatch):
+    monkeypatch.setenv("AWS_REGION", "eu-west-1")
+    uri = ae_arctic.arctic_uri("test-bucket", region="us-west-2")
+    assert "s3.us-west-2.amazonaws.com" in uri
+
+
+def test_arctic_uri_matches_existing_preflight_format(monkeypatch):
+    """Guard against drift — the uri string must be byte-identical to what
+    preflight.check_arcticdb_fresh currently builds. Any consumer that
+    interacts with existing ArcticDB libraries depends on this exact URI
+    (different URIs point at different library indexes, even if the bucket
+    is the same)."""
+    monkeypatch.setenv("AWS_REGION", "us-east-1")
+    expected = (
+        "s3s://s3.us-east-1.amazonaws.com:alpha-engine-research"
+        "?path_prefix=arcticdb&aws_auth=true"
+    )
+    assert ae_arctic.arctic_uri("alpha-engine-research") == expected
+
+
+# ── ImportError handling ─────────────────────────────────────────────────────
+
+
+def test_import_helper_raises_runtimeerror_when_arcticdb_missing(monkeypatch):
+    """When arcticdb is not installed, _import_arcticdb must wrap the
+    ImportError in a RuntimeError with install guidance."""
+    # Simulate arcticdb being absent by blocking the import.
+    real_import = __builtins__["__import__"] if isinstance(__builtins__, dict) else __builtins__.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "arcticdb":
+            raise ImportError("No module named 'arcticdb'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", fake_import)
+
+    with pytest.raises(RuntimeError, match="alpha-engine-lib\\[arcticdb\\]"):
+        ae_arctic._import_arcticdb()
+
+
+# ── open_universe_lib / open_macro_lib error wrapping ────────────────────────
+
+
+class _StubArctic:
+    """Stub that raises on get_library to exercise the error wrapper."""
+
+    def __init__(self, raise_on_get: bool = False):
+        self._raise = raise_on_get
+
+    def get_library(self, name):
+        if self._raise:
+            raise RuntimeError(f"fake get_library failure for {name}")
+        return _StubLibrary(name)
+
+
+class _StubLibrary:
+    def __init__(self, name, symbols=None):
+        self._name = name
+        self._symbols = symbols if symbols is not None else ["A", "B", "C"]
+
+    def list_symbols(self):
+        return list(self._symbols)
+
+
+def _stub_arcticdb_module():
+    mod = types.ModuleType("arcticdb")
+    mod.Arctic = lambda uri: _StubArctic(raise_on_get=False)
+    return mod
+
+
+def test_open_universe_lib_wraps_errors_with_bucket_context(monkeypatch):
+    """When get_library raises, open_universe_lib must raise a RuntimeError
+    whose message names the bucket, URI, and library — so an operator can
+    see *which* endpoint is failing."""
+    mod = types.ModuleType("arcticdb")
+    mod.Arctic = lambda uri: _StubArctic(raise_on_get=True)
+    monkeypatch.setitem(sys.modules, "arcticdb", mod)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        ae_arctic.open_universe_lib("broken-bucket")
+    msg = str(exc_info.value)
+    assert "universe" in msg
+    assert "broken-bucket" in msg
+    assert "uri=" in msg
+
+
+def test_open_macro_lib_wraps_errors(monkeypatch):
+    mod = types.ModuleType("arcticdb")
+    mod.Arctic = lambda uri: _StubArctic(raise_on_get=True)
+    monkeypatch.setitem(sys.modules, "arcticdb", mod)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        ae_arctic.open_macro_lib("broken-bucket")
+    assert "macro" in str(exc_info.value)
+
+
+def test_open_universe_lib_returns_library_on_success(monkeypatch):
+    monkeypatch.setitem(sys.modules, "arcticdb", _stub_arcticdb_module())
+    lib = ae_arctic.open_universe_lib("test-bucket")
+    assert isinstance(lib, _StubLibrary)
+    assert lib._name == "universe"
+
+
+# ── get_universe_symbols ─────────────────────────────────────────────────────
+
+
+def test_get_universe_symbols_returns_set(monkeypatch):
+    monkeypatch.setitem(sys.modules, "arcticdb", _stub_arcticdb_module())
+    symbols = ae_arctic.get_universe_symbols("test-bucket")
+    assert symbols == {"A", "B", "C"}
+    assert isinstance(symbols, set)
+
+
+def test_get_universe_symbols_raises_if_list_fails(monkeypatch):
+    class _BrokenLibrary(_StubLibrary):
+        def list_symbols(self):
+            raise RuntimeError("list failure")
+
+    mod = types.ModuleType("arcticdb")
+    class _ArcticWithBrokenLib:
+        def get_library(self, name):
+            return _BrokenLibrary(name)
+    mod.Arctic = lambda uri: _ArcticWithBrokenLib()
+    monkeypatch.setitem(sys.modules, "arcticdb", mod)
+
+    with pytest.raises(RuntimeError, match="list_symbols"):
+        ae_arctic.get_universe_symbols("test-bucket")
