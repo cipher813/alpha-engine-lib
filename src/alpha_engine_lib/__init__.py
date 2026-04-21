@@ -1,3 +1,3 @@
 """alpha-engine-lib — shared utilities for Alpha Engine modules."""
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
