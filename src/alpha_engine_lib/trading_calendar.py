@@ -115,6 +115,63 @@ def next_trading_day(d: date | None = None) -> date:
     return d
 
 
+def previous_trading_day(d: date | None = None) -> date:
+    """Return the most recent NYSE trading day strictly before the given date."""
+    if d is None:
+        d = date.today()
+    d = d - timedelta(days=1)
+    while not is_trading_day(d):
+        d = d - timedelta(days=1)
+    return d
+
+
+def add_trading_days(start: date, n: int) -> date:
+    """Add ``n`` NYSE trading days to ``start`` (n >= 0).
+
+    Skips weekends + NYSE holidays. ``add_trading_days(d, 0) == d``
+    (no rounding to a trading day if ``d`` itself is not one — only
+    the forward steps land on trading days).
+
+    Use ``subtract_trading_days`` for negative offsets.
+    """
+    if n < 0:
+        raise ValueError(f"add_trading_days requires n >= 0, got {n}")
+    current = start
+    for _ in range(n):
+        current = next_trading_day(current)
+    return current
+
+
+def subtract_trading_days(start: date, n: int) -> date:
+    """Subtract ``n`` NYSE trading days from ``start`` (n >= 0)."""
+    if n < 0:
+        raise ValueError(f"subtract_trading_days requires n >= 0, got {n}")
+    current = start
+    for _ in range(n):
+        current = previous_trading_day(current)
+    return current
+
+
+def count_trading_days(start: date, end: date) -> int:
+    """Count NYSE trading days strictly between ``start`` and ``end``.
+
+    Half-open interval ``(start, end]`` — same convention as
+    ``add_trading_days``: ``count_trading_days(d, add_trading_days(d, n)) == n``
+    for any ``n >= 0`` and ``d`` (whether or not ``d`` is a trading day).
+
+    Returns 0 when ``end <= start``.
+    """
+    if end <= start:
+        return 0
+    total = 0
+    current = start
+    while current < end:
+        current = current + timedelta(days=1)
+        if is_trading_day(current):
+            total += 1
+    return total
+
+
 # NYSE regular-session close (early-close holidays like the day after
 # Thanksgiving close at 1 PM ET; we keep 4 PM as the conservative
 # threshold — consumers waiting on post-close data should not assume
