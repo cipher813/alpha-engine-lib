@@ -3,6 +3,8 @@
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
+import pytest
+
 from alpha_engine_lib.dates import DualDate, now_dual, session_for_timestamp
 
 
@@ -104,14 +106,10 @@ class TestNowDualInputHandling:
         assert now_dual(now=naive).calendar_date == now_dual(now=aware).calendar_date
 
     def test_dual_date_is_frozen(self):
+        from dataclasses import FrozenInstanceError
         dd = now_dual()
-        # Frozen dataclass — should not be mutable.
-        try:
+        with pytest.raises(FrozenInstanceError):
             dd.calendar_date = "2099-01-01"  # type: ignore
-        except Exception as exc:
-            assert "frozen" in str(exc).lower() or "can't set" in str(exc).lower()
-        else:
-            raise AssertionError("DualDate should be frozen")
 
 
 class TestSessionForTimestamp:
