@@ -13,15 +13,21 @@ state-capture-260429.md``.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 
+import boto3
 import pytest
+from moto import mock_aws
 
 from alpha_engine_lib.decision_capture import (
     DecisionArtifact,
+    DecisionCaptureWriteError,
     FullPromptContext,
     ModelMetadata,
     _INPUT_SNAPSHOT_DEFAULT_CAP_BYTES,
+    _build_s3_key,
     _serialized_size,
+    capture_decision,
     truncate_snapshot,
 )
 
@@ -293,3 +299,278 @@ class TestTruncateSnapshotDefaultCap:
         # 300 KB < 1 MB cap — should pass through untruncated
         assert original_size is None
         assert result == payload
+
+
+# ── _build_s3_key ─────────────────────────────────────────────────────────
+
+
+class TestBuildS3Key:
+    def test_canonical_format(self):
+        dt = datetime(2026, 4, 29, 22, 30, 0, tzinfo=timezone.utc)
+        key = _build_s3_key(
+            s3_prefix="decision_artifacts",
+            capture_dt=dt,
+            agent_id="sector_quant",
+            run_id="run-abc123",
+        )
+        assert key == "decision_artifacts/2026/04/29/sector_quant/run-abc123.json"
+
+    def test_zero_padded_month_and_day(self):
+        dt = datetime(2026, 1, 5, 0, 0, 0, tzinfo=timezone.utc)
+        key = _build_s3_key(
+            s3_prefix="decision_artifacts",
+            capture_dt=dt,
+            agent_id="cio",
+            run_id="r1",
+        )
+        # Single-digit month + day must be zero-padded for lexical sort
+        assert key == "decision_artifacts/2026/01/05/cio/r1.json"
+
+    def test_custom_prefix(self):
+        dt = datetime(2026, 4, 29, tzinfo=timezone.utc)
+        key = _build_s3_key(
+            s3_prefix="staging/decision_artifacts",
+            capture_dt=dt,
+            agent_id="x",
+            run_id="r",
+        )
+        assert key.startswith("staging/decision_artifacts/")
+
+
+# ── capture_decision (happy path) ─────────────────────────────────────────
+
+
+@pytest.fixture
+def mocked_s3():
+    """moto-mocked S3 client + pre-created bucket."""
+    with mock_aws():
+        client = boto3.client("s3", region_name="us-east-1")
+        client.create_bucket(Bucket="alpha-engine-research")
+        yield client
+
+
+def _minimal_capture_kwargs(s3_client, **overrides):
+    """Helper for tests: minimal valid kwargs for capture_decision."""
+    base = {
+        "run_id": "run-2026-04-29",
+        "agent_id": "sector_quant",
+        "model_metadata": ModelMetadata(model_name="claude-haiku-4-5"),
+        "full_prompt_context": FullPromptContext(
+            system_prompt="sys", user_prompt="user",
+        ),
+        "input_data_snapshot": {"market_regime": "neutral", "tickers": ["AAPL"]},
+        "agent_output": {"recommendations": [{"ticker": "AAPL", "score": 75}]},
+        "s3_client": s3_client,
+        "timestamp": datetime(2026, 4, 29, 22, 30, 0, tzinfo=timezone.utc),
+    }
+    base.update(overrides)
+    return base
+
+
+class TestCaptureDecisionHappyPath:
+    def test_writes_artifact_at_canonical_key(self, mocked_s3):
+        s3_key = capture_decision(**_minimal_capture_kwargs(mocked_s3))
+        assert s3_key == (
+            "decision_artifacts/2026/04/29/sector_quant/run-2026-04-29.json"
+        )
+
+    def test_artifact_content_round_trips(self, mocked_s3):
+        s3_key = capture_decision(**_minimal_capture_kwargs(mocked_s3))
+        obj = mocked_s3.get_object(
+            Bucket="alpha-engine-research", Key=s3_key,
+        )
+        body = json.loads(obj["Body"].read())
+        # Round-trip via DecisionArtifact for full validation
+        artifact = DecisionArtifact.model_validate(body)
+        assert artifact.run_id == "run-2026-04-29"
+        assert artifact.agent_id == "sector_quant"
+        assert artifact.model_metadata.model_name == "claude-haiku-4-5"
+        assert artifact.input_data_snapshot["market_regime"] == "neutral"
+        assert artifact.agent_output["recommendations"][0]["ticker"] == "AAPL"
+        assert artifact.input_data_truncated_at is None
+        assert artifact.input_data_summary is None
+
+    def test_content_type_is_json(self, mocked_s3):
+        s3_key = capture_decision(**_minimal_capture_kwargs(mocked_s3))
+        obj = mocked_s3.get_object(
+            Bucket="alpha-engine-research", Key=s3_key,
+        )
+        assert obj["ContentType"] == "application/json"
+
+    def test_summary_preserved_on_artifact(self, mocked_s3):
+        kwargs = _minimal_capture_kwargs(
+            mocked_s3,
+            input_data_summary="Sector=Technology, 5 candidates",
+        )
+        s3_key = capture_decision(**kwargs)
+        obj = mocked_s3.get_object(Bucket="alpha-engine-research", Key=s3_key)
+        artifact = DecisionArtifact.model_validate(json.loads(obj["Body"].read()))
+        assert artifact.input_data_summary == "Sector=Technology, 5 candidates"
+
+    def test_custom_bucket_and_prefix(self, mocked_s3):
+        # Pre-create the alternate bucket
+        mocked_s3.create_bucket(Bucket="my-alt-bucket")
+        s3_key = capture_decision(
+            **_minimal_capture_kwargs(
+                mocked_s3,
+                s3_bucket="my-alt-bucket",
+                s3_prefix="staging/dec_arts",
+            )
+        )
+        assert s3_key.startswith("staging/dec_arts/2026/04/29/")
+        # Content should be in the custom bucket
+        obj = mocked_s3.get_object(Bucket="my-alt-bucket", Key=s3_key)
+        assert obj["ContentType"] == "application/json"
+
+    def test_idempotent_overwrite_on_same_key(self, mocked_s3):
+        # Two captures with the same run_id + agent_id + date overwrite.
+        # S3 PUT semantics — the second call wins.
+        kwargs1 = _minimal_capture_kwargs(mocked_s3)
+        kwargs1["agent_output"] = {"recommendations": [{"ticker": "AAPL"}]}
+        capture_decision(**kwargs1)
+
+        kwargs2 = _minimal_capture_kwargs(mocked_s3)
+        kwargs2["agent_output"] = {"recommendations": [{"ticker": "MSFT"}]}
+        s3_key = capture_decision(**kwargs2)
+
+        obj = mocked_s3.get_object(Bucket="alpha-engine-research", Key=s3_key)
+        body = json.loads(obj["Body"].read())
+        # Second write wins
+        assert body["agent_output"]["recommendations"][0]["ticker"] == "MSFT"
+
+
+class TestCaptureDecisionTruncation:
+    def test_oversized_snapshot_records_truncated_at(self, mocked_s3):
+        # Snapshot just over the 1MB cap
+        huge_field = "x" * 1_500_000
+        kwargs = _minimal_capture_kwargs(
+            mocked_s3,
+            input_data_snapshot={"small": "ok", "huge_chunks": huge_field},
+        )
+        s3_key = capture_decision(**kwargs)
+        obj = mocked_s3.get_object(Bucket="alpha-engine-research", Key=s3_key)
+        artifact = DecisionArtifact.model_validate(json.loads(obj["Body"].read()))
+
+        assert artifact.input_data_truncated_at is not None
+        assert artifact.input_data_truncated_at > 1_500_000
+        # Truncation marker preserved in the snapshot
+        huge_value = artifact.input_data_snapshot["huge_chunks"]
+        assert isinstance(huge_value, dict)
+        assert huge_value["_truncated"] is True
+        # Small field preserved
+        assert artifact.input_data_snapshot["small"] == "ok"
+
+    def test_under_cap_snapshot_no_truncation_marker(self, mocked_s3):
+        # Steady-state-sized snapshot
+        kwargs = _minimal_capture_kwargs(
+            mocked_s3,
+            input_data_snapshot={"a": "small", "b": [1, 2, 3]},
+        )
+        s3_key = capture_decision(**kwargs)
+        obj = mocked_s3.get_object(Bucket="alpha-engine-research", Key=s3_key)
+        artifact = DecisionArtifact.model_validate(json.loads(obj["Body"].read()))
+        assert artifact.input_data_truncated_at is None
+
+    def test_custom_cap_overrides_default(self, mocked_s3):
+        # Force truncation by passing a tiny cap on a normal-sized payload.
+        kwargs = _minimal_capture_kwargs(
+            mocked_s3,
+            input_data_snapshot={"x": "y" * 1000},
+            snapshot_cap_bytes=200,
+        )
+        s3_key = capture_decision(**kwargs)
+        obj = mocked_s3.get_object(Bucket="alpha-engine-research", Key=s3_key)
+        artifact = DecisionArtifact.model_validate(json.loads(obj["Body"].read()))
+        assert artifact.input_data_truncated_at is not None
+
+
+class TestCaptureDecisionTimestamp:
+    def test_caller_timestamp_used_for_iso_field(self, mocked_s3):
+        ts = datetime(2026, 4, 29, 22, 30, 45, tzinfo=timezone.utc)
+        kwargs = _minimal_capture_kwargs(mocked_s3, timestamp=ts)
+        s3_key = capture_decision(**kwargs)
+        obj = mocked_s3.get_object(Bucket="alpha-engine-research", Key=s3_key)
+        artifact = DecisionArtifact.model_validate(json.loads(obj["Body"].read()))
+        # ISO format starts with the supplied date+time
+        assert artifact.timestamp.startswith("2026-04-29T22:30:45")
+
+    def test_default_timestamp_is_now_utc(self, mocked_s3):
+        # Don't pass timestamp — the wrapper should default to now()
+        kwargs = _minimal_capture_kwargs(mocked_s3)
+        del kwargs["timestamp"]
+        before = datetime.now(timezone.utc)
+        s3_key = capture_decision(**kwargs)
+        after = datetime.now(timezone.utc)
+
+        obj = mocked_s3.get_object(Bucket="alpha-engine-research", Key=s3_key)
+        artifact = DecisionArtifact.model_validate(json.loads(obj["Body"].read()))
+        captured = datetime.fromisoformat(artifact.timestamp)
+        assert before <= captured <= after
+
+
+# ── capture_decision hard-fail paths ──────────────────────────────────────
+
+
+class TestCaptureDecisionHardFail:
+    def test_missing_bucket_raises(self, mocked_s3):
+        # mocked_s3 has only "alpha-engine-research"; route to a bucket
+        # that doesn't exist
+        kwargs = _minimal_capture_kwargs(
+            mocked_s3,
+            s3_bucket="this-bucket-does-not-exist",
+        )
+        with pytest.raises(DecisionCaptureWriteError, match=r"Failed to write"):
+            capture_decision(**kwargs)
+
+    def test_error_message_names_the_s3_path(self, mocked_s3):
+        kwargs = _minimal_capture_kwargs(
+            mocked_s3,
+            s3_bucket="missing-bucket",
+            run_id="run-x",
+            agent_id="cio",
+        )
+        try:
+            capture_decision(**kwargs)
+            pytest.fail("expected DecisionCaptureWriteError")
+        except DecisionCaptureWriteError as e:
+            msg = str(e)
+            # Bucket name + S3 key both named in the error so operator
+            # can find the failed write quickly
+            assert "missing-bucket" in msg
+            assert "decision_artifacts/2026/04/29/cio/run-x.json" in msg
+
+    def test_error_chains_underlying_boto_exception(self, mocked_s3):
+        kwargs = _minimal_capture_kwargs(
+            mocked_s3,
+            s3_bucket="this-bucket-does-not-exist",
+        )
+        try:
+            capture_decision(**kwargs)
+            pytest.fail("expected DecisionCaptureWriteError")
+        except DecisionCaptureWriteError as e:
+            # __cause__ points at the underlying ClientError per the
+            # ``raise ... from exc`` pattern
+            assert e.__cause__ is not None
+
+    def test_does_NOT_swallow_silently(self, mocked_s3):
+        """Critical guard per feedback_no_silent_fails: capture_decision
+        MUST raise on S3 failure, NOT log-and-continue."""
+        kwargs = _minimal_capture_kwargs(
+            mocked_s3, s3_bucket="missing-bucket",
+        )
+        # If this test ever fails, it means someone has loosened the
+        # hard-fail contract. Capture the regression at the source.
+        with pytest.raises(DecisionCaptureWriteError):
+            capture_decision(**kwargs)
+
+
+# ── DecisionCaptureWriteError exception class ─────────────────────────────
+
+
+class TestDecisionCaptureWriteError:
+    def test_is_runtime_error_subclass(self):
+        # Subclassing RuntimeError lets callers catch it via the broader
+        # type if they want best-effort capture (with their own metric
+        # for the silent-loss case), without picking up unrelated
+        # exceptions.
+        assert issubclass(DecisionCaptureWriteError, RuntimeError)
