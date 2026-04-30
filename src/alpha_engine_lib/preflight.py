@@ -161,6 +161,138 @@ class BasePreflight:
                 f"(threshold {max_stale_days})"
             )
 
+    def check_arcticdb_universe_fresh(
+        self,
+        library: str,
+        max_stale_days: int,
+        *,
+        max_workers: int = 20,
+    ) -> None:
+        """Scan every symbol in ``library`` and raise if any symbol's
+        last_date is older than ``max_stale_days`` calendar days from
+        today (UTC).
+
+        Where :meth:`check_arcticdb_fresh` covers a single canonical
+        liveness probe (e.g. macro/SPY), this primitive catches the
+        partial-write class — individual tickers stop receiving writes
+        while the canonical SPY symbol stays fresh, so the single-symbol
+        check reports healthy but downstream consumers fail two hours
+        deep on stale per-ticker reads.
+
+        Motivation (2026-04-21 backtester incident): macro.SPY was fresh,
+        ASGN + MOH had stalled at 2026-04-01 because daily_append silently
+        skipped them, executor's load_atr_14_pct guard aborted the
+        backtester ~2 hours into its predictor-backtest mode. This scan
+        catches the same class at preflight in ~5-10 seconds (20 threads
+        × ~900 tickers × tail(1) read each).
+
+        Implementation notes:
+        - Reads ``tail(1)`` rather than the full series — ~20ms/symbol.
+        - Read errors on any symbol are themselves fatal: a silent read
+          error here would mask exactly the kind of write-skip this
+          primitive exists to catch.
+        - Stale list is sorted by stalest-first so the operator sees
+          the worst offenders without scrolling.
+
+        Requires the ``arcticdb`` optional extra
+        (``alpha-engine-lib[arcticdb]``).
+
+        Args:
+            library: ArcticDB library name to scan (e.g. ``"universe"``).
+            max_stale_days: Symbols with ``last_date`` older than today
+                minus this many calendar days are flagged as stale.
+            max_workers: Thread pool size for the per-symbol scan.
+                Default 20 matches backtester precedent. Tune lower for
+                rate-limited backends; higher for fan-out-bound cases.
+
+        Raises:
+            RuntimeError: If arcticdb is unimportable, the library is
+                unreachable, the library is empty, any symbol's
+                ``tail(1)`` read raises, or ANY symbol is stale beyond
+                the threshold.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+        from datetime import date, timedelta
+
+        try:
+            import arcticdb as adb
+            import pandas as pd
+        except ImportError as exc:
+            raise RuntimeError(
+                "Pre-flight: arcticdb not importable — install "
+                "alpha-engine-lib[arcticdb] or add arcticdb to the deploy image: "
+                f"{exc}"
+            ) from exc
+
+        uri = (
+            f"s3s://s3.{self.region}.amazonaws.com:{self.bucket}"
+            "?path_prefix=arcticdb&aws_auth=true"
+        )
+        try:
+            lib = adb.Arctic(uri).get_library(library)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Pre-flight: ArcticDB library {library!r} unreachable "
+                f"at {uri}: {exc}"
+            ) from exc
+
+        symbols = list(lib.list_symbols())
+        if not symbols:
+            raise RuntimeError(
+                f"Pre-flight: ArcticDB library {library!r} on bucket "
+                f"{self.bucket!r} has zero symbols — upstream pipeline "
+                "has not written anything."
+            )
+
+        today = date.today()
+        cutoff = today - timedelta(days=max_stale_days)
+
+        def _last_date_for(sym: str) -> tuple[str, "date | None", "str | None"]:
+            try:
+                df = lib.tail(sym, n=1).data
+                if df.empty:
+                    return sym, None, "empty frame"
+                last_ts = pd.Timestamp(df.index[-1])
+                if last_ts.tzinfo is not None:
+                    last_ts = last_ts.tz_convert("UTC").tz_localize(None)
+                return sym, last_ts.date(), None
+            except Exception as exc:  # pragma: no cover — covered via mock
+                return sym, None, str(exc)
+
+        stale: list[tuple[str, date]] = []
+        errored: list[tuple[str, str]] = []
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            for sym, last_date, err in pool.map(_last_date_for, symbols):
+                if err is not None:
+                    errored.append((sym, err))
+                elif last_date is None:
+                    errored.append((sym, "no last_date"))
+                elif last_date < cutoff:
+                    stale.append((sym, last_date))
+
+        if errored:
+            sample = [f"{s}({e[:40]})" for s, e in errored[:5]]
+            raise RuntimeError(
+                f"Pre-flight: {len(errored)} symbol(s) in ArcticDB "
+                f"library {library!r} could not be read for freshness check. "
+                f"Sample: {sample}. Treated as fatal because a silent read "
+                "error here would mask exactly the kind of per-symbol write "
+                "skip this scan exists to catch."
+            )
+
+        if stale:
+            stale.sort(key=lambda x: x[1])
+            summary = [f"{sym} (last={d.isoformat()})" for sym, d in stale[:10]]
+            more = f" (+{len(stale) - 10} more)" if len(stale) > 10 else ""
+            raise RuntimeError(
+                f"Pre-flight: {len(stale)}/{len(symbols)} symbol(s) in "
+                f"ArcticDB library {library!r} have stale data (older "
+                f"than {max_stale_days} calendar days, "
+                f"cutoff={cutoff.isoformat()}). Top offenders: "
+                f"{summary}{more}. Backfill upstream or investigate "
+                "the per-symbol write path before re-running."
+            )
+
     def check_ib_paper_account(self, account_id: str) -> None:
         """Raise if ``account_id`` doesn't start with 'D' (IBKR paper prefix).
 
