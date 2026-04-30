@@ -206,3 +206,162 @@ def test_check_arcticdb_fresh_stale_raises():
         # Set "now" implicitly — stale_df is 2026-04-01, today is 2026-04-14+
         with pytest.raises(RuntimeError, match="days stale"):
             p.check_arcticdb_fresh("universe", "SPY", max_stale_days=4)
+
+
+# ── check_arcticdb_universe_fresh (per-symbol scan) ──────────────────────
+
+
+def _build_mock_lib(symbol_to_last_date: dict, fail_symbols: tuple = ()):
+    """Helper: construct a mocked ArcticDB library where ``tail(sym, n=1)``
+    returns a frame with ``last_date`` for each symbol, or raises for
+    symbols in ``fail_symbols``."""
+    pd = pytest.importorskip("pandas")
+    mock_lib = mock.Mock()
+    mock_lib.list_symbols.return_value = list(symbol_to_last_date.keys())
+
+    def _tail(sym, n=1):
+        if sym in fail_symbols:
+            raise RuntimeError(f"simulated read failure for {sym}")
+        last = symbol_to_last_date[sym]
+        df = pd.DataFrame(
+            {"Close": [1.0]},
+            index=pd.DatetimeIndex([pd.Timestamp(last)]),
+        )
+        item = mock.Mock()
+        item.data = df
+        return item
+
+    mock_lib.tail.side_effect = _tail
+    return mock_lib
+
+
+def test_check_arcticdb_universe_fresh_missing_import_raises():
+    p = _Concrete("bkt")
+    with mock.patch.dict("sys.modules", {"arcticdb": None}):
+        with pytest.raises(RuntimeError, match="arcticdb not importable"):
+            p.check_arcticdb_universe_fresh("universe", max_stale_days=5)
+
+
+def test_check_arcticdb_universe_fresh_all_fresh_passes():
+    pytest.importorskip("pandas")
+    try:
+        import arcticdb  # noqa: F401
+    except ImportError:
+        pytest.skip("arcticdb not installed")
+
+    today = datetime.now(timezone.utc).date()
+    fresh = {
+        "AAPL": today,
+        "MSFT": today - timedelta(days=1),
+        "NVDA": today - timedelta(days=2),
+    }
+    mock_lib = _build_mock_lib(fresh)
+    mock_arctic = mock.Mock()
+    mock_arctic.get_library.return_value = mock_lib
+
+    p = _Concrete("bkt")
+    with mock.patch("arcticdb.Arctic", return_value=mock_arctic):
+        p.check_arcticdb_universe_fresh("universe", max_stale_days=5)
+
+
+def test_check_arcticdb_universe_fresh_stale_symbol_raises():
+    pytest.importorskip("pandas")
+    try:
+        import arcticdb  # noqa: F401
+    except ImportError:
+        pytest.skip("arcticdb not installed")
+
+    today = datetime.now(timezone.utc).date()
+    mixed = {
+        "AAPL": today,
+        "ASGN": today - timedelta(days=30),  # well past 5d threshold
+        "MSFT": today - timedelta(days=1),
+    }
+    mock_lib = _build_mock_lib(mixed)
+    mock_arctic = mock.Mock()
+    mock_arctic.get_library.return_value = mock_lib
+
+    p = _Concrete("bkt")
+    with mock.patch("arcticdb.Arctic", return_value=mock_arctic):
+        with pytest.raises(RuntimeError, match=r"have stale data.*ASGN"):
+            p.check_arcticdb_universe_fresh("universe", max_stale_days=5)
+
+
+def test_check_arcticdb_universe_fresh_empty_library_raises():
+    pytest.importorskip("pandas")
+    try:
+        import arcticdb  # noqa: F401
+    except ImportError:
+        pytest.skip("arcticdb not installed")
+
+    mock_lib = mock.Mock()
+    mock_lib.list_symbols.return_value = []
+    mock_arctic = mock.Mock()
+    mock_arctic.get_library.return_value = mock_lib
+
+    p = _Concrete("bkt")
+    with mock.patch("arcticdb.Arctic", return_value=mock_arctic):
+        with pytest.raises(RuntimeError, match="zero symbols"):
+            p.check_arcticdb_universe_fresh("universe", max_stale_days=5)
+
+
+def test_check_arcticdb_universe_fresh_read_error_is_fatal():
+    """A symbol that can't be read is treated as fatal — silent read
+    errors here would mask exactly the write-skip class this scan
+    exists to catch."""
+    pytest.importorskip("pandas")
+    try:
+        import arcticdb  # noqa: F401
+    except ImportError:
+        pytest.skip("arcticdb not installed")
+
+    today = datetime.now(timezone.utc).date()
+    symbols = {"AAPL": today, "BROKEN": today, "MSFT": today}
+    mock_lib = _build_mock_lib(symbols, fail_symbols=("BROKEN",))
+    mock_arctic = mock.Mock()
+    mock_arctic.get_library.return_value = mock_lib
+
+    p = _Concrete("bkt")
+    with mock.patch("arcticdb.Arctic", return_value=mock_arctic):
+        with pytest.raises(RuntimeError, match=r"could not be read.*BROKEN"):
+            p.check_arcticdb_universe_fresh("universe", max_stale_days=5)
+
+
+def test_check_arcticdb_universe_fresh_library_unreachable_raises():
+    pytest.importorskip("pandas")
+    try:
+        import arcticdb  # noqa: F401
+    except ImportError:
+        pytest.skip("arcticdb not installed")
+
+    mock_arctic = mock.Mock()
+    mock_arctic.get_library.side_effect = RuntimeError("S3 timeout")
+
+    p = _Concrete("bkt")
+    with mock.patch("arcticdb.Arctic", return_value=mock_arctic):
+        with pytest.raises(RuntimeError, match="library 'universe' unreachable"):
+            p.check_arcticdb_universe_fresh("universe", max_stale_days=5)
+
+
+def test_check_arcticdb_universe_fresh_stale_list_truncated_at_10():
+    """When more than 10 symbols are stale, the error message lists
+    the 10 stalest plus a +N more counter."""
+    pytest.importorskip("pandas")
+    try:
+        import arcticdb  # noqa: F401
+    except ImportError:
+        pytest.skip("arcticdb not installed")
+
+    today = datetime.now(timezone.utc).date()
+    # 15 stale symbols; staleness varies so sort-by-stalest can be checked
+    stale = {
+        f"TKR{i:02d}": today - timedelta(days=10 + i) for i in range(15)
+    }
+    mock_lib = _build_mock_lib(stale)
+    mock_arctic = mock.Mock()
+    mock_arctic.get_library.return_value = mock_lib
+
+    p = _Concrete("bkt")
+    with mock.patch("arcticdb.Arctic", return_value=mock_arctic):
+        with pytest.raises(RuntimeError, match=r"\+5 more"):
+            p.check_arcticdb_universe_fresh("universe", max_stale_days=5)
