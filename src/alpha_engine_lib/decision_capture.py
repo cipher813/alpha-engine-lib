@@ -56,12 +56,22 @@ logger = logging.getLogger(__name__)
 
 
 class ModelMetadata(BaseModel):
-    """Per-invocation model identifier + token cost.
+    """Per-invocation model identifier + token cost + run/agent context.
 
     Token counts are zero-defaulted because some agent paths don't track
-    cache reads/creates. ``cost_usd`` is computed at capture time from
-    token counts × the active price table; storing the materialized cost
-    avoids re-pricing if the rate card changes later.
+    cache reads/creates. ``cost_usd`` is a derived convenience: the load-
+    bearing facts are token counts (immutable) and the active price card
+    at the time of the call. Use :func:`alpha_engine_lib.cost.recompute_cost`
+    to recompute from token counts whenever the rate card changes — never
+    treat ``cost_usd`` as canonical for analytics.
+
+    The remaining fields propagate run + agent context through the cost
+    telemetry stream so that cost rows can be drilled down by agent,
+    sector team, run type, and prompt version. All optional — populated
+    by callers as the matching upstream features ship (prompt versioning
+    populates ``prompt_id`` + ``prompt_version``; the LangGraph node
+    wrapper populates ``node_name``; the run-orchestrator populates
+    ``run_type`` + ``sector_team_id``).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -73,6 +83,11 @@ class ModelMetadata(BaseModel):
     cache_read_tokens: int = Field(default=0, ge=0)
     cache_create_tokens: int = Field(default=0, ge=0)
     cost_usd: float = Field(default=0.0, ge=0.0)
+    run_type: Literal["weekly_research", "morning", "EOD"] | None = None
+    node_name: str | None = None
+    sector_team_id: str | None = None
+    prompt_id: str | None = None
+    prompt_version: str | None = None
 
 
 class FullPromptContext(BaseModel):
