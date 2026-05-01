@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "alpha-engine-lib"
-version = "0.2.2"
+version = "0.2.3"
 description = "Shared utilities for Alpha Engine modules — preflight checks, logging, and other cross-cutting helpers"
 readme = "README.md"
 # EC2 still runs Python 3.9 on the always-on micro instance (boto3 drops
@@ -17,6 +17,7 @@ license = { text = "Proprietary" }
 dependencies = [
     "boto3>=1.34",
     "pydantic>=2.0",
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]

@@ -42,6 +42,12 @@ class TestModelMetadata:
         assert m.output_tokens == 0
         assert m.cost_usd == 0.0
         assert m.model_version is None
+        # Cost-telemetry context fields default to None.
+        assert m.run_type is None
+        assert m.node_name is None
+        assert m.sector_team_id is None
+        assert m.prompt_id is None
+        assert m.prompt_version is None
 
     def test_full(self):
         m = ModelMetadata(
@@ -54,6 +60,26 @@ class TestModelMetadata:
             cost_usd=0.04321,
         )
         assert m.cost_usd == 0.04321
+
+    def test_full_with_telemetry_context(self):
+        m = ModelMetadata(
+            model_name="claude-haiku-4-5",
+            input_tokens=1000,
+            output_tokens=500,
+            run_type="weekly_research",
+            node_name="sector_quant_node",
+            sector_team_id="technology",
+            prompt_id="sector_quant_analyst",
+            prompt_version="1.2.0",
+        )
+        assert m.run_type == "weekly_research"
+        assert m.sector_team_id == "technology"
+        assert m.prompt_version == "1.2.0"
+
+    def test_run_type_literal_enforced(self):
+        # run_type is a Literal — invalid value rejected at validation.
+        with pytest.raises(ValueError):
+            ModelMetadata(model_name="x", run_type="adhoc")
 
     def test_negative_token_counts_rejected(self):
         with pytest.raises(ValueError):
