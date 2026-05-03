@@ -17,20 +17,21 @@ The lib's job is to keep the same code from being maintained six times.
 
 ```
 # requirements.txt
-alpha-engine-lib @ git+https://github.com/cipher813/alpha-engine-lib@v0.2.4
+alpha-engine-lib @ git+https://github.com/cipher813/alpha-engine-lib@v0.3.0
 ```
 
-Tagged releases: `v0.1.0`, `v0.2.0`, `v0.2.4`, etc. Consumers pin to a specific tag. Breaking changes bump the minor version while Alpha Engine is in pre-1.0.
+Tagged releases: `v0.1.0`, `v0.2.0`, `v0.3.0`, etc. Consumers pin to a specific tag. Breaking changes bump the minor version while Alpha Engine is in pre-1.0.
 
 ```bash
 # With optional extras
-pip install "alpha-engine-lib[arcticdb] @ git+https://github.com/cipher813/alpha-engine-lib@v0.2.4"
+pip install "alpha-engine-lib[arcticdb] @ git+https://github.com/cipher813/alpha-engine-lib@v0.3.0"
 ```
 
 | Extra | Pulls in | When you need it |
 |---|---|---|
 | `[arcticdb]` | `arcticdb`, `pandas` | Anything that calls `check_arcticdb_fresh` or the ArcticDB read/write helpers |
 | `[flow_doctor]` | `flow-doctor` | Logging integration that escalates ERROR-level events to flow-doctor |
+| `[rag]` | `psycopg2-binary`, `pgvector`, `numpy` | The `rag` submodule — Neon pgvector RAG retrieval/ingestion |
 | `[dev]` | `pytest`, lint tooling | Local development |
 
 ## Modules
@@ -91,14 +92,31 @@ Captures every agent decision as a structured artifact: prompt metadata (id + ve
 
 Token-aware cost computation following Anthropic's prompt-caching semantics (cache-write vs cache-read pricing). Used by every LLM call site to attach a `cost_usd` to its output.
 
+### `rag` — semantic retrieval over SEC filings, transcripts, and theses
+
+Neon pgvector backbone shared by `alpha-engine-research` (qual analyst's `query_filings` tool) and `alpha-engine-data` (weekly RAGIngestion step). Re-exports a small surface — `retrieve`, `ingest_document`, `document_exists`, `embed_texts`, `get_connection`, `is_available` — and ships the canonical `schema.sql` as package data.
+
+```python
+from alpha_engine_lib.rag import retrieve
+
+results = retrieve(
+    query="competitive risks and market position",
+    tickers=["AAPL"],
+    doc_types=["10-K", "10-Q", "earnings_transcript"],
+    top_k=8,
+)
+```
+
+Requires the `[rag]` extra. Embeddings are Voyage `voyage-3-lite` (512d); the database backend is Neon Postgres with pgvector + HNSW indexes.
+
 ## How it's used
 
 All six Nous Ergon module repos depend on this lib:
 
 | Module | Repo | What it imports from here |
 |---|---|---|
-| Data | [`alpha-engine-data`](https://github.com/cipher813/alpha-engine-data) | `logging`, `preflight`, `arcticdb`, `dates`, `trading_calendar` |
-| Research | [`alpha-engine-research`](https://github.com/cipher813/alpha-engine-research) | `logging`, `decision_capture`, `cost`, `dates` |
+| Data | [`alpha-engine-data`](https://github.com/cipher813/alpha-engine-data) | `logging`, `preflight`, `arcticdb`, `dates`, `trading_calendar`, `rag` (ingestion) |
+| Research | [`alpha-engine-research`](https://github.com/cipher813/alpha-engine-research) | `logging`, `decision_capture`, `cost`, `dates`, `rag` (retrieval) |
 | Predictor | [`alpha-engine-predictor`](https://github.com/cipher813/alpha-engine-predictor) | `logging`, `preflight`, `arcticdb`, `dates` |
 | Executor | [`alpha-engine`](https://github.com/cipher813/alpha-engine) | `logging`, `preflight`, `arcticdb`, `dates`, `trading_calendar` |
 | Backtester | [`alpha-engine-backtester`](https://github.com/cipher813/alpha-engine-backtester) | `logging`, `preflight`, `arcticdb`, `dates` |
