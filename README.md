@@ -17,14 +17,14 @@ The lib's job is to keep the same code from being maintained six times.
 
 ```
 # requirements.txt
-alpha-engine-lib @ git+https://github.com/cipher813/alpha-engine-lib@v0.3.0
+alpha-engine-lib @ git+https://github.com/cipher813/alpha-engine-lib@v0.4.0
 ```
 
-Tagged releases: `v0.1.0`, `v0.2.0`, `v0.3.0`, etc. Consumers pin to a specific tag. Breaking changes bump the minor version while Alpha Engine is in pre-1.0.
+Tagged releases: `v0.1.0`, `v0.2.0`, `v0.3.0`, `v0.4.0`, etc. Consumers pin to a specific tag. Breaking changes bump the minor version while Alpha Engine is in pre-1.0.
 
 ```bash
 # With optional extras
-pip install "alpha-engine-lib[arcticdb] @ git+https://github.com/cipher813/alpha-engine-lib@v0.3.0"
+pip install "alpha-engine-lib[arcticdb] @ git+https://github.com/cipher813/alpha-engine-lib@v0.4.0"
 ```
 
 | Extra | Pulls in | When you need it |
@@ -92,6 +92,25 @@ Captures every agent decision as a structured artifact: prompt metadata (id + ve
 
 Token-aware cost computation following Anthropic's prompt-caching semantics (cache-write vs cache-read pricing). Used by every LLM call site to attach a `cost_usd` to its output.
 
+### `agent_schemas` — canonical LLM-output Pydantic schemas
+
+Shared contract surface for the 14 LLM-output classes used in `with_structured_output(...)` calls across the research pipeline (sector quant + qual + peer review, macro economist + critic, held-stock thesis update, CIO, eval-judge rubric). Lives here so downstream tooling — replay harness in alpha-engine-backtester, future cheap-model-concordance signals — can validate against the canonical contract without a heavy cross-repo dep on research.
+
+```python
+from alpha_engine_lib.agent_schemas import (
+    QuantAnalystOutput,
+    JointFinalizationOutput,
+    CIORawOutput,
+    HeldThesisUpdateLLMOutput,
+    resolve_schema_for_agent,
+)
+
+# Dispatch by captured agent_id (e.g. "sector_quant:technology" → QuantAnalystOutput)
+schema = resolve_schema_for_agent(agent_id)
+```
+
+`SCHEMA_BY_AGENT_ID_BASE` covers the 6 canonical agent families: `sector_quant`, `sector_qual`, `sector_peer_review`, `macro_economist`, `ic_cio`, `thesis_update`. Validators that defend observed LLM failure modes (sector-modifier clamp, JSON-string-as-list parser, `min_length=1` on CIO decisions) move with their classes.
+
 ### `rag` — semantic retrieval over SEC filings, transcripts, and theses
 
 Neon pgvector backbone shared by `alpha-engine-research` (qual analyst's `query_filings` tool) and `alpha-engine-data` (weekly RAGIngestion step). Re-exports a small surface — `retrieve`, `ingest_document`, `document_exists`, `embed_texts`, `get_connection`, `is_available` — and ships the canonical `schema.sql` as package data.
@@ -116,10 +135,10 @@ All six Nous Ergon module repos depend on this lib:
 | Module | Repo | What it imports from here |
 |---|---|---|
 | Data | [`alpha-engine-data`](https://github.com/cipher813/alpha-engine-data) | `logging`, `preflight`, `arcticdb`, `dates`, `trading_calendar`, `rag` (ingestion) |
-| Research | [`alpha-engine-research`](https://github.com/cipher813/alpha-engine-research) | `logging`, `decision_capture`, `cost`, `dates`, `rag` (retrieval) |
+| Research | [`alpha-engine-research`](https://github.com/cipher813/alpha-engine-research) | `logging`, `decision_capture`, `cost`, `dates`, `rag` (retrieval), `agent_schemas` (canonical LLM-output contracts) |
 | Predictor | [`alpha-engine-predictor`](https://github.com/cipher813/alpha-engine-predictor) | `logging`, `preflight`, `arcticdb`, `dates` |
 | Executor | [`alpha-engine`](https://github.com/cipher813/alpha-engine) | `logging`, `preflight`, `arcticdb`, `dates`, `trading_calendar` |
-| Backtester | [`alpha-engine-backtester`](https://github.com/cipher813/alpha-engine-backtester) | `logging`, `preflight`, `arcticdb`, `dates` |
+| Backtester | [`alpha-engine-backtester`](https://github.com/cipher813/alpha-engine-backtester) | `logging`, `preflight`, `arcticdb`, `dates`, `agent_schemas` (replay-harness Pydantic validation) |
 | Dashboard | [`alpha-engine-dashboard`](https://github.com/cipher813/alpha-engine-dashboard) | `logging`, `arcticdb`, `dates` |
 
 ## Development
