@@ -1,7 +1,12 @@
 """Voyage embedding wrapper for RAG document and query embeddings.
 
-Uses Voyage voyage-3-lite (1024 dimensions), optimized for retrieval on
+Uses Voyage voyage-3-lite (512 dimensions), optimized for retrieval on
 financial text. Batch support up to 128 texts per call.
+
+The 512d output matches the ``embedding vector(512)`` column declared
+in ``rag/schema.sql`` — pgvector enforces dimension on INSERT, so any
+drift between the model and the schema would be a hard failure on
+ingestion.
 
 Requires: VOYAGE_API_KEY environment variable.
 """
@@ -40,7 +45,7 @@ def embed_texts(
         batch_size: Max texts per API call (Voyage limit is 128).
 
     Returns:
-        List of embedding vectors (each 1024 floats for voyage-3-lite).
+        List of embedding vectors (each 512 floats for voyage-3-lite).
     """
     client = _get_client()
     all_embeddings = []
