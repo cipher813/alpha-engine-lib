@@ -21,11 +21,26 @@ hard-fails still live in the hardened collectors themselves.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import urllib.error
+import urllib.request
+import warnings
 from datetime import datetime, timezone
+from pathlib import Path
 
 log = logging.getLogger(__name__)
+
+# Default location for the deploy-time GIT_SHA stamp inside a Lambda
+# image. Stamped by deploy.sh via ``--build-arg GIT_SHA=…`` then COPYed
+# to /var/task/GIT_SHA.txt; consumers running outside Lambda can pass an
+# alternate path.
+_DEFAULT_GIT_SHA_FILE = Path("/var/task/GIT_SHA.txt")
+
+# Public-repo branch-HEAD API. No auth required; 60 req/hr unauth rate
+# limit is fine for Lambda cold-starts and CI runs.
+_GITHUB_BRANCH_URL = "https://api.github.com/repos/{repo}/branches/{branch}"
 
 
 class BasePreflight:
@@ -168,7 +183,19 @@ class BasePreflight:
         *,
         max_workers: int = 20,
     ) -> None:
-        """Scan every symbol in ``library`` and raise if any symbol's
+        """[DEPRECATED 2026-05-05] Per-symbol freshness scan over an
+        ArcticDB library.
+
+        Deprecated because data-freshness now lives upstream in
+        ``alpha-engine-data``'s preflight, which runs before any
+        consumer in every Step Function. Consumers (executor,
+        backtester, predictor) dropped their calls in 2026-05-05's
+        consolidation arc. Scheduled for removal after 6-month soak;
+        current callers should migrate to trusting SF ordering.
+
+        Original docstring follows.
+
+        Scan every symbol in ``library`` and raise if any symbol's
         last_date is older than ``max_stale_days`` calendar days from
         today (UTC).
 
@@ -211,6 +238,15 @@ class BasePreflight:
                 ``tail(1)`` read raises, or ANY symbol is stale beyond
                 the threshold.
         """
+        warnings.warn(
+            "BasePreflight.check_arcticdb_universe_fresh is deprecated; "
+            "data-freshness now lives upstream in alpha-engine-data's "
+            "preflight (runs before consumers in every Step Function). "
+            "Scheduled for removal after 6-month soak.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
         from concurrent.futures import ThreadPoolExecutor
         from datetime import date, timedelta
 
@@ -306,3 +342,99 @@ class BasePreflight:
                 f"Pre-flight: IB account_id {account_id!r} is not a paper "
                 "account (paper accounts start with 'D')"
             )
+
+    def check_deploy_drift(
+        self,
+        repo: str,
+        branch: str = "main",
+        *,
+        sha_file: Path | None = None,
+        timeout: float = 5.0,
+    ) -> None:
+        """Hard-fail if the deploy-baked SHA lags ``repo@branch`` HEAD.
+
+        The deployed image is stamped with ``GIT_SHA`` at build time
+        (via Docker ``--build-arg GIT_SHA=…``); this check compares
+        that stamp against the current ``branch`` HEAD SHA on GitHub.
+        A mismatch means a merge landed on main but the CI deploy
+        workflow either failed, was skipped by a paths filter, or
+        hasn't run yet — i.e. the deployed code is a prior commit,
+        which is exactly the deploy-drift mode that motivated this
+        check (2026-04-20 coverage-gap session).
+
+        Degraded modes (warn, don't fail) — chosen so a GitHub outage
+        or an unstamped legacy image doesn't block a trading-hours
+        Lambda:
+        - Stamp file missing or "unknown"  → image predates drift
+          checking; log warn and continue.
+        - GitHub API unreachable           → log warn and continue.
+
+        Hard-fail mode — when both stamps are present and differ.
+
+        Args:
+            repo: ``"owner/name"`` — e.g. ``"cipher813/alpha-engine-predictor"``.
+            branch: Branch HEAD to compare against. Default ``"main"``.
+            sha_file: Path to the GIT_SHA stamp. Defaults to
+                ``/var/task/GIT_SHA.txt`` (Lambda image convention).
+            timeout: GitHub API timeout in seconds.
+        """
+        baked = _read_baked_git_sha(sha_file or _DEFAULT_GIT_SHA_FILE)
+        if baked is None:
+            log.warning(
+                "Deploy-drift: no baked GIT_SHA in image at %s (legacy build "
+                "or build-arg omitted). Rebuild via deploy.sh to enable this check.",
+                sha_file or _DEFAULT_GIT_SHA_FILE,
+            )
+            return
+
+        upstream = _fetch_origin_main_sha(repo, branch=branch, timeout=timeout)
+        if upstream is None:
+            # _fetch_origin_main_sha already logged the reason
+            return
+
+        if baked != upstream:
+            raise RuntimeError(
+                f"Deploy drift: image was built from {baked[:12]} but "
+                f"{repo}@{branch} is now at {upstream[:12]}. The CI deploy "
+                f"workflow did not promote the latest commit. Re-run "
+                f"`.github/workflows/deploy.yml` on main (or the local "
+                f"deploy.sh) before resuming. Refusing to proceed — "
+                f"running stale code on new signals is how 2026-04-20 happened."
+            )
+
+        log.info("Deploy-drift: image at %s matches %s@%s ✓", baked[:12], repo, branch)
+
+
+def _read_baked_git_sha(sha_file: Path) -> str | None:
+    """Return the SHA baked into the image by ``deploy.sh --build-arg GIT_SHA=…``.
+
+    Returns ``None`` if the stamp file is missing (legacy image) or holds
+    ``"unknown"`` (build-arg omitted). Callers decide whether ``None`` is
+    warn-and-continue or hard-fail.
+    """
+    try:
+        sha = sha_file.read_text().strip()
+    except FileNotFoundError:
+        return None
+    if not sha or sha == "unknown":
+        return None
+    return sha
+
+
+def _fetch_origin_main_sha(repo: str, branch: str = "main", timeout: float = 5.0) -> str | None:
+    """Fetch HEAD SHA of ``branch`` for ``repo`` via GitHub REST API.
+
+    Returns ``None`` on any network/parse error — the drift check treats a
+    GitHub outage as "unknown, proceed with warning" rather than blocking
+    the consumer. ``repo`` is ``"owner/name"`` (e.g.
+    ``"cipher813/alpha-engine-predictor"``).
+    """
+    url = _GITHUB_BRANCH_URL.format(repo=repo, branch=branch)
+    req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read())
+        return payload.get("commit", {}).get("sha")
+    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError) as exc:
+        log.warning("Deploy-drift: GitHub API unreachable (%s) — cannot compare", exc)
+        return None

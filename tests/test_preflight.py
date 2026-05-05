@@ -365,3 +365,97 @@ def test_check_arcticdb_universe_fresh_stale_list_truncated_at_10():
     with mock.patch("arcticdb.Arctic", return_value=mock_arctic):
         with pytest.raises(RuntimeError, match=r"\+5 more"):
             p.check_arcticdb_universe_fresh("universe", max_stale_days=5)
+
+
+def test_check_arcticdb_universe_fresh_emits_deprecation_warning():
+    """The primitive emits DeprecationWarning so callers know it's
+    scheduled for removal. Data-freshness moved upstream 2026-05-05."""
+    try:
+        import arcticdb  # noqa: F401
+    except ImportError:
+        pytest.skip("arcticdb not installed")
+
+    mock_arctic = mock.Mock()
+    mock_arctic.get_library.side_effect = RuntimeError("don't actually scan")
+
+    p = _Concrete("bkt")
+    with mock.patch("arcticdb.Arctic", return_value=mock_arctic):
+        with pytest.warns(DeprecationWarning, match="moved upstream|deprecated"):
+            with pytest.raises(RuntimeError):
+                p.check_arcticdb_universe_fresh("universe", max_stale_days=5)
+
+
+# ── check_deploy_drift ────────────────────────────────────────────────────
+
+
+def test_check_deploy_drift_passes_when_baked_matches_upstream(tmp_path):
+    """Image SHA matches origin/main → no raise + info log."""
+    sha = "abc123def456ghi789jkl012mno345pqr678stu9"
+    sha_file = tmp_path / "GIT_SHA.txt"
+    sha_file.write_text(sha + "\n")
+
+    p = _Concrete("bkt")
+    with mock.patch(
+        "alpha_engine_lib.preflight._fetch_origin_main_sha",
+        return_value=sha,
+    ):
+        p.check_deploy_drift("cipher813/alpha-engine-foo", sha_file=sha_file)
+
+
+def test_check_deploy_drift_raises_on_sha_mismatch(tmp_path):
+    """Baked SHA differs from origin/main HEAD → hard-fail with both stamps."""
+    sha_file = tmp_path / "GIT_SHA.txt"
+    sha_file.write_text("aaaaaaaa" * 5 + "\n")
+
+    p = _Concrete("bkt")
+    with mock.patch(
+        "alpha_engine_lib.preflight._fetch_origin_main_sha",
+        return_value="bbbbbbbb" * 5,
+    ):
+        with pytest.raises(RuntimeError, match="Deploy drift"):
+            p.check_deploy_drift("cipher813/alpha-engine-foo", sha_file=sha_file)
+
+
+def test_check_deploy_drift_warns_and_passes_when_stamp_missing(tmp_path, caplog):
+    """No GIT_SHA stamp file (legacy build) → warn-and-pass, no GitHub call."""
+    p = _Concrete("bkt")
+    with mock.patch(
+        "alpha_engine_lib.preflight._fetch_origin_main_sha",
+    ) as fetch:
+        with caplog.at_level("WARNING"):
+            p.check_deploy_drift(
+                "cipher813/alpha-engine-foo",
+                sha_file=tmp_path / "does-not-exist",
+            )
+        fetch.assert_not_called()
+    assert any("no baked GIT_SHA" in r.message for r in caplog.records)
+
+
+def test_check_deploy_drift_warns_and_passes_on_unknown_stamp(tmp_path, caplog):
+    """Stamp file holds 'unknown' (build-arg omitted) → warn-and-pass."""
+    sha_file = tmp_path / "GIT_SHA.txt"
+    sha_file.write_text("unknown\n")
+
+    p = _Concrete("bkt")
+    with mock.patch(
+        "alpha_engine_lib.preflight._fetch_origin_main_sha",
+    ) as fetch:
+        with caplog.at_level("WARNING"):
+            p.check_deploy_drift("cipher813/alpha-engine-foo", sha_file=sha_file)
+        fetch.assert_not_called()
+    assert any("no baked GIT_SHA" in r.message for r in caplog.records)
+
+
+def test_check_deploy_drift_warns_and_passes_on_github_outage(tmp_path):
+    """GitHub API returns None (outage / parse error) → warn-and-pass.
+    A trading-hours Lambda must not block on a transient GitHub issue."""
+    sha_file = tmp_path / "GIT_SHA.txt"
+    sha_file.write_text("abcdef1234567890" + "\n")
+
+    p = _Concrete("bkt")
+    with mock.patch(
+        "alpha_engine_lib.preflight._fetch_origin_main_sha",
+        return_value=None,
+    ):
+        # No exception expected
+        p.check_deploy_drift("cipher813/alpha-engine-foo", sha_file=sha_file)
