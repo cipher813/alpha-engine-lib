@@ -66,3 +66,32 @@ def test_is_available_safe_when_db_unreachable(monkeypatch):
     monkeypatch.setenv("RAG_DATABASE_URL", "postgresql://nope:nope@localhost:1/nope")
     result = is_available()
     assert result is False
+
+
+def test_no_bare_rag_imports_in_lib():
+    """Inside the lib, every `rag.*` import must be relative or fully qualified.
+
+    The v0.3.0 RAG consolidation moved code from consumer-side `rag/` packages
+    into `alpha_engine_lib.rag`, but four deferred imports inside retrieval.py
+    were left as bare `from rag.X import ...`. They worked when called from a
+    consumer that had its own top-level `rag/` package on sys.path, but blew
+    up on the spot orchestrator (alpha-engine-data) where the package was
+    already migrated out, only firing when the dedup branch was hit during a
+    real ingestion run. Catch the class statically — walk every module file
+    in the rag submodule and assert no `^\\s*(from|import)\\s+rag\\.` lines.
+    """
+    import re
+    import importlib.resources as ir
+
+    pattern = re.compile(r"^\s*(from|import)\s+rag\.", re.MULTILINE)
+    rag_files = ir.files("alpha_engine_lib.rag")
+    offenders: list[str] = []
+    for entry in rag_files.iterdir():
+        if entry.name.endswith(".py"):
+            text = entry.read_text()
+            if pattern.search(text):
+                offenders.append(entry.name)
+    assert not offenders, (
+        f"Bare `rag.*` imports found in {offenders}; use relative imports "
+        "(`from .db import …`) inside the lib package"
+    )

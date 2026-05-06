@@ -48,8 +48,8 @@ def retrieve(
     Returns:
         List of RetrievalResult sorted by similarity (highest first).
     """
-    from rag.embeddings import embed_query
-    from rag.db import get_connection
+    from .embeddings import embed_query
+    from .db import get_connection
 
     query_vec = embed_query(query)
 
@@ -107,7 +107,7 @@ def retrieve(
 
 def document_exists(ticker: str, doc_type: str, filed_date: date, source: str) -> bool:
     """Check if a document has already been ingested (dedup)."""
-    from rag.db import execute_query
+    from .db import execute_query
 
     rows = execute_query(
         "SELECT 1 FROM rag.documents WHERE ticker=%s AND doc_type=%s AND filed_date=%s AND source=%s LIMIT 1",
@@ -141,7 +141,7 @@ def ingest_document(
     Returns:
         Document UUID on success, None on failure.
     """
-    from rag.db import get_connection
+    from .db import get_connection
 
     if document_exists(ticker, doc_type, filed_date, source):
         logger.debug("Skipping duplicate: %s %s %s", ticker, doc_type, filed_date)
