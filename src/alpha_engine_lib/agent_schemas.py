@@ -155,13 +155,56 @@ class JointFinalizationDecision(BaseModel):
     )
 
 
+class JointSelectionOutput(BaseModel):
+    """Side-LLM call: peer_review's two-pass joint finalization, Pass 1.
+
+    Pass 1 emits the ticker-list selection + cross-pick context only,
+    deferring per-ticker rationale generation to Pass 2 (which fans out
+    to one bounded ``JointFinalizationDecision`` call per selected
+    ticker). Two-pass design replaces the prior single-pass
+    ``JointFinalizationOutput`` call after 2026-05-03 + 2026-05-06
+    truncation incidents where Haiku-emitted rationales blew past
+    ``max_tokens_strategic`` mid-emission and the entire selection was
+    lost. With the selection separated, Pass 1's output is bounded by
+    construction (N tickers × ~10 tokens + a 1-2 sentence team
+    rationale = ~200 tokens), eliminating the truncation class for the
+    selection step regardless of model verbosity drift.
+
+    The legacy ``JointFinalizationOutput`` schema below stays for
+    replay-harness compatibility against historical artifacts.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    selected_tickers: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Array of selected ticker symbols (e.g. ['NVDA', 'PLTR', "
+            "'RKLB']). One entry per pick, structured array (NOT a "
+            "JSON-encoded string)."
+        ),
+    )
+    team_rationale: str = Field(
+        default="",
+        description=(
+            "Cross-pick rationale — sector concentration, regime fit "
+            "across the slate, asymmetry mix. 1-2 sentences."
+        ),
+    )
+
+
 class JointFinalizationOutput(BaseModel):
     """Side-LLM call: peer_review's joint quant+qual finalization, picks
     the team's 2-3 final recommendations from the merged candidate set.
 
     Per-ticker rationale lives on each ``selected_decisions`` entry;
     ``team_rationale`` carries cross-pick context (sector concentration,
-    regime fit across the slate)."""
+    regime fit across the slate).
+
+    LEGACY single-pass schema. Production peer_review now uses the
+    two-pass flow (``JointSelectionOutput`` + per-ticker
+    ``JointFinalizationDecision`` calls). This schema stays for replay
+    harness invocation against historical artifacts pre-cutover."""
 
     model_config = ConfigDict(extra="allow")
 

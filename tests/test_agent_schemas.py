@@ -74,6 +74,44 @@ class TestQualAnalystOutput:
 # ── Peer review ──────────────────────────────────────────────────────────
 
 
+class TestJointSelectionOutput:
+    """The two-pass flow's Pass 1 schema. Ticker-list + team-rationale
+    only — per-ticker rationale moves to Pass 2 (one bounded
+    JointFinalizationDecision call per selected ticker)."""
+
+    def test_accepts_typical_payload(self):
+        from alpha_engine_lib.agent_schemas import JointSelectionOutput
+
+        out = JointSelectionOutput(
+            selected_tickers=["NVDA", "PLTR", "RKLB"],
+            team_rationale="Asymmetric high-R/R slate, AI-infrastructure tilt.",
+        )
+        assert len(out.selected_tickers) == 3
+        assert out.selected_tickers[0] == "NVDA"
+
+    def test_empty_selection_is_valid(self):
+        """Edge case: agent emits an empty selection (no candidates clear
+        the gate). Schema must accept; downstream gate decides whether
+        empty is a hard-fail or graceful no-op."""
+        from alpha_engine_lib.agent_schemas import JointSelectionOutput
+
+        out = JointSelectionOutput()
+        assert out.selected_tickers == []
+        assert out.team_rationale == ""
+
+    def test_extra_fields_allowed(self):
+        """``extra='allow'`` lets the LLM emit forward-compatible fields
+        (e.g. ``confidence``) without breaking validation."""
+        from alpha_engine_lib.agent_schemas import JointSelectionOutput
+
+        out = JointSelectionOutput(
+            selected_tickers=["NVDA"],
+            team_rationale="",
+            confidence=0.85,
+        )
+        assert out.selected_tickers == ["NVDA"]
+
+
 class TestJointFinalizationOutput:
     def test_accepts_typical_payload(self):
         from alpha_engine_lib.agent_schemas import JointFinalizationOutput
