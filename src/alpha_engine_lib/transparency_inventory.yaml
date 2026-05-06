@@ -1,0 +1,221 @@
+# Phase 2 → 3 transparency inventory.
+#
+# Each row is a decision point in the Alpha Engine pipeline that must
+# emit a measurement output. The substrate health checker reads this
+# file, validates that each row's expected artifact exists with the
+# expected cadence and content, and emits per-row CloudWatch metrics
+# the alarm layer fires off.
+#
+# Source of truth for the prose form of these rows is the Phase 2
+# trajectory snippet at
+# alpha-engine-docs/private/presentation-layer-drafts-260505/
+# 01_phase_trajectory_snippet.md. When a row changes meaning (e.g. a
+# new content assertion is added by a downstream PR), update both.
+#
+# `effective_date` is the first date a row is expected to have data.
+# Rows whose instrumentation shipped recently get a forward-dated
+# value so the checker treats them as not-yet-expected until the
+# first relevant event populates the artifact.
+
+version: 1
+
+inventory:
+
+  - id: pipeline_execution
+    cadence: weekly
+    effective_date: 2026-04-01
+    description: >-
+      SF success rate ≥ 99% across Saturday + weekday + EOD pipelines,
+      with per-stage durations recorded.
+    sources:
+      - kind: cloudwatch
+        namespace: AWS/States
+        metric: ExecutionsSucceeded
+        # Validated against ExecutionsFailed for ratio. Per-state machine
+        # success rate computed over a 7-day trailing window.
+        dimensions:
+          StateMachineArn:
+            - alpha-engine-saturday-pipeline
+            - alpha-engine-weekday-pipeline
+            - alpha-engine-eod-pipeline
+        window_days: 7
+        assert:
+          op: success_rate_pct_gte
+          value: 99
+
+  - id: agent_decisions
+    cadence: weekly
+    # First Saturday SF observation after backtester #146 (decision
+    # capture coverage % published from evaluator).
+    effective_date: 2026-05-09
+    description: >-
+      Per-call artifact: prompt version + decision-capture record + cost
+      telemetry + judge rubric scores. Coverage ≥ 99%.
+    sources:
+      - kind: s3_json
+        bucket: alpha-engine-research
+        # The backtester writes the per-run JSON to backtest/{date}/.
+        # The most recent date's artifact is the authoritative one.
+        key_pattern: backtest/{date}/decision_capture_coverage.json
+        max_age_days: 8
+        assert:
+          - path: coverage_pct
+            op: gte
+            value: 99
+
+  - id: predictor_decisions
+    cadence: daily
+    effective_date: 2026-04-01
+    description: >-
+      Per-L1-component IC + L2 IC + confidence calibration + feature
+      contributions.
+    sources:
+      - kind: s3_json
+        bucket: alpha-engine-research
+        key: predictor/metrics/latest.json
+        max_age_days: 8
+        assert_keys_present:
+          - l1_ic
+          - l2_ic
+          - confidence_calibration
+
+  - id: trade_execution_lineage
+    cadence: daily
+    # First ENTER fill after executor #138 (signal_date + prediction_date
+    # lineage columns shipped 2026-05-06).
+    effective_date: 2026-05-07
+    description: >-
+      Per-fill: entry trigger + sizing breakdown + signal_date and
+      prediction_date lineage columns populated on every ENTER row.
+    sources:
+      - kind: s3_csv
+        bucket: alpha-engine-research
+        key: trades/trades_full.csv
+        max_age_days: 4
+        assert_columns_present:
+          - signal_date
+          - prediction_date
+          - entry_trigger
+        assert_columns_non_null_for_rows_after:
+          date_column: date
+          rows_after: 2026-05-07
+          action_filter:
+            column: action
+            equals: BUY
+          columns:
+            - signal_date
+            - prediction_date
+
+  - id: risk_events
+    cadence: daily
+    # First veto after executor #139 (structured risk_events table
+    # shipped 2026-05-06).
+    effective_date: 2026-05-07
+    description: >-
+      Per-event log of risk decisions (veto / override / halt) with
+      rule + reason + value at threshold.
+    sources:
+      # The risk_events table lives inside trades.db, mirrored to S3
+      # at trades/trades_latest.db after each EOD reconcile. The check
+      # downloads the DB, queries the table, and validates schema +
+      # presence (no daily-row-count assertion — vetoes may not fire
+      # every day, the contract is "the table exists and the rule
+      # captures any event that happens").
+      - kind: sqlite_via_s3
+        bucket: alpha-engine-research
+        key: trades/trades_latest.db
+        max_age_days: 4
+        table: risk_events
+        assert_columns_present:
+          - rule
+          - reason
+          - value
+          - threshold
+
+  - id: pnl_attribution
+    cadence: daily
+    # First EOD reconcile after executor #140 (unattributed_residual_pct
+    # + 5 attribution columns shipped 2026-05-06).
+    effective_date: 2026-05-07
+    description: >-
+      Per-day attributed dollars (research / predictor / sizing / market)
+      + unattributed residual ≤ 1% of NAV.
+    sources:
+      - kind: s3_csv
+        bucket: alpha-engine-research
+        key: trades/eod_pnl.csv
+        max_age_days: 4
+        assert_columns_present:
+          - unattributed_residual_pct
+          - position_pnl_usd
+          - interest_usd
+          - dividend_usd
+          - unattributed_usd
+        assert_value_on_latest_row:
+          column: unattributed_residual_pct
+          op: lte
+          value: 1.0
+
+  - id: config_changes
+    cadence: weekly
+    effective_date: 2026-04-01
+    description: >-
+      Per-change diff log + rationale + subsequent-week behavioral delta
+      for autonomous-loop config updates (scoring weights, executor
+      params, predictor veto threshold, research boost params).
+    sources:
+      # Backtester optimizers write per-run change records under
+      # backtest/{date}/. The aggregate changelog under config/ is the
+      # canonical history; the per-run record is what the checker
+      # validates for the most-recent run.
+      - kind: s3_json
+        bucket: alpha-engine-research
+        key_pattern: backtest/{date}/optimizer_changes.json
+        max_age_days: 8
+        # Optional artifact — a quiet week with no config changes is
+        # valid; the check passes if the file exists OR if the file
+        # is absent AND the most recent backtest run completed (signal
+        # via metrics.json presence).
+        treat_absent_as: ok_if_companion_present
+        companion_key_pattern: backtest/{date}/metrics.json
+
+  - id: data_quality
+    cadence: daily
+    # data #159 stamped per-row source attribution on daily_closes
+    # 2026-05-05; first weekday-SF run with the column populated was
+    # 2026-05-06.
+    effective_date: 2026-05-06
+    description: >-
+      Per-row source attribution + per-feature NaN/outlier rates +
+      freshness on the daily_closes intermediate parquet.
+    sources:
+      - kind: s3_parquet
+        bucket: alpha-engine-research
+        key_pattern: staging/daily_closes/{date}.parquet
+        max_age_days: 4
+        assert_columns_present:
+          - source
+          - ticker
+          - close
+        assert_column_non_null:
+          - source
+
+  - id: agent_quality
+    cadence: weekly
+    effective_date: 2026-04-01
+    description: >-
+      Rolling 4-week mean of LLM-as-judge rubric scores per
+      (judged_agent_id, criterion, judge_model) combo. The min across
+      all combos is the alarm-bearing metric; the substrate check
+      validates the metric is being emitted weekly.
+    sources:
+      - kind: cloudwatch
+        namespace: AlphaEngine/Eval
+        metric: agent_quality_score_4w_mean_min
+        window_days: 14
+        # Presence check — alarm threshold (mean < 3.0 emits SNS) lives
+        # in CloudWatch alarm config, not here. Substrate check just
+        # validates the derived metric is being emitted weekly.
+        assert:
+          op: datapoints_gte
+          value: 1
