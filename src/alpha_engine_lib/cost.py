@@ -37,7 +37,7 @@ overlap or unsorted input per ``feedback_no_silent_fails``.
 - :exc:`PriceCardLookupError` — raised when no card matches a (model, date)
   query (do not swallow).
 
-Workstream design: ``alpha-engine-docs/private/ROADMAP.md`` line ~1708
+Workstream design: ``alpha-engine-config/private-docs/ROADMAP.md`` line ~1708
 ("Per-run LLM cost telemetry as code artifact").
 """
 
