@@ -493,7 +493,11 @@ def _check_cloudwatch(
     window_days = src.get("window_days", 7)
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=window_days)
-    period = max(60, window_days * 86400 // 100)
+    # AWS GetMetricStatistics requires Period to be a multiple of 60. Aim
+    # for ~100 datapoints across the window, then round down to a multiple
+    # of 60 (with a 60s floor for the smallest windows).
+    raw_period = max(60, window_days * 86400 // 100)
+    period = max(60, (raw_period // 60) * 60)
 
     artifact = f"cw://{namespace}/{metric}"
     assertion = src.get("assert", {})
