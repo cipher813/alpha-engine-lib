@@ -459,3 +459,44 @@ def test_check_deploy_drift_warns_and_passes_on_github_outage(tmp_path):
     ):
         # No exception expected
         p.check_deploy_drift("cipher813/alpha-engine-foo", sha_file=sha_file)
+
+
+# ── _fetch_origin_main_sha network-error coverage ─────────────────────────
+# Direct unit tests for the helper's except clause — the upstream tests
+# above all mock the helper, so a regression in its catch-tuple (e.g.
+# the 2026-05-07 weekday SF crash where TimeoutError leaked past
+# URLError) wouldn't surface there.
+
+def test_fetch_origin_main_sha_returns_none_on_url_error():
+    import urllib.error
+    from alpha_engine_lib.preflight import _fetch_origin_main_sha
+    with mock.patch(
+        "urllib.request.urlopen",
+        side_effect=urllib.error.URLError("dns failure"),
+    ):
+        assert _fetch_origin_main_sha("cipher813/alpha-engine-foo") is None
+
+
+def test_fetch_origin_main_sha_returns_none_on_read_timeout():
+    """Regression: urlopen raises a bare TimeoutError on read-phase
+    timeouts (inside getresponse), not URLError. The 2026-05-07 weekday
+    SF DeployDriftCheck Lambda crashed because the previous catch tuple
+    only listed URLError/HTTPError. The helper is documented as
+    warn-and-continue on any GitHub-side error, so this must degrade
+    gracefully too."""
+    from alpha_engine_lib.preflight import _fetch_origin_main_sha
+    with mock.patch(
+        "urllib.request.urlopen",
+        side_effect=TimeoutError("The read operation timed out"),
+    ):
+        assert _fetch_origin_main_sha("cipher813/alpha-engine-foo") is None
+
+
+def test_fetch_origin_main_sha_returns_none_on_json_parse_error():
+    from alpha_engine_lib.preflight import _fetch_origin_main_sha
+    fake_resp = mock.MagicMock()
+    fake_resp.read.return_value = b"not valid json{{{"
+    fake_resp.__enter__ = mock.MagicMock(return_value=fake_resp)
+    fake_resp.__exit__ = mock.MagicMock(return_value=False)
+    with mock.patch("urllib.request.urlopen", return_value=fake_resp):
+        assert _fetch_origin_main_sha("cipher813/alpha-engine-foo") is None
