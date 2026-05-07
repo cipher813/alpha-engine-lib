@@ -130,6 +130,37 @@ def test_inventory_yaml_is_packaged():
     assert INVENTORY_PATH.parent.name == "alpha_engine_lib"
 
 
+def test_data_quality_row_matches_actual_parquet_columns():
+    """Regression for the 2026-05-06 first-substrate-exercise drift —
+    inventory expected ``ticker`` (which is the parquet *index*, not a
+    column) and lowercase ``close`` (actual column is ``Close``). Pin the
+    fix so the row's column-presence assertions match the
+    daily_closes producer contract: parquet has columns ``date``,
+    ``Open/High/Low/Close``, ``Adj_Close``, ``Volume``, ``VWAP``,
+    ``source``; ``ticker`` is the index name. The producer contract has
+    been stable since the staging-prefix migration (data #112,
+    2026-04-29) and shouldn't move; future drift on this side
+    indicates an inventory bug, not a producer bug."""
+    inv = load_inventory()
+    row = next(r for r in inv["inventory"] if r["id"] == "data_quality")
+    src = row["sources"][0]
+    assert src["kind"] == "s3_parquet"
+    cols = src["assert_columns_present"]
+    assert "Close" in cols, (
+        "data_quality must check the canonical capital-C ``Close`` column "
+        "the daily_closes parquet actually emits"
+    )
+    assert "close" not in cols, (
+        "lowercase ``close`` is not a column on daily_closes parquet — "
+        "regression of the 2026-05-06 inventory drift"
+    )
+    assert "ticker" not in cols, (
+        "``ticker`` is the parquet *index*, not a column — "
+        "regression of the 2026-05-06 inventory drift"
+    )
+    assert "source" in cols  # core attribution column from data #159
+
+
 # ---------------------------------------------------------------------------
 # check_inventory: cadence filtering + effective_date gating
 # ---------------------------------------------------------------------------
