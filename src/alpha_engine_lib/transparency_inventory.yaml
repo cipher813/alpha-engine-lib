@@ -193,10 +193,14 @@ inventory:
         bucket: alpha-engine-research
         key_pattern: staging/daily_closes/{date}.parquet
         max_age_days: 4
+        # daily_closes parquet has ``ticker`` as the index (not a column)
+        # and uses capital-C ``Close`` for the close price. The earlier
+        # ``ticker`` + ``close`` entries were inventory drift — not
+        # producer bugs. The producer contract has been stable since
+        # the staging-prefix migration (data #112, 2026-04-29).
         assert_columns_present:
           - source
-          - ticker
-          - close
+          - Close
         assert_column_non_null:
           - source
 
