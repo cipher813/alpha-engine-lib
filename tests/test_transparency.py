@@ -58,6 +58,7 @@ class StubCloudWatch:
     def __init__(self) -> None:
         self.put_calls: list[dict] = []
         self.stats: dict[tuple[str, str, tuple[tuple[str, str], ...]], list[dict]] = {}
+        self.get_calls: list[dict] = []
 
     def set_stats(
         self,
@@ -71,6 +72,7 @@ class StubCloudWatch:
         self.stats[key] = datapoints
 
     def get_metric_statistics(self, **kw):
+        self.get_calls.append(kw)
         ns = kw["Namespace"]
         m = kw["MetricName"]
         dims = tuple(
@@ -638,6 +640,107 @@ def test_cloudwatch_success_rate_passes():
         s3_client=StubS3(), cloudwatch_client=cw,
     )
     assert res[0].status == "ok"
+
+
+@pytest.mark.parametrize("window_days", [1, 7, 14, 28, 90])
+def test_cloudwatch_period_is_multiple_of_60(window_days):
+    """AWS GetMetricStatistics rejects ``Period`` values that are not multiples
+    of 60. Regression for the 2026-05-06 first-substrate-exercise bug where
+    ``window_days=7`` produced ``Period=6048`` (=7*86400//100), getting
+    rejected with ``InvalidParameterValue: The parameter Period must be a
+    multiple of 60``."""
+    inv = {
+        "version": 1,
+        "inventory": [
+            {
+                "id": "row",
+                "cadence": "weekly",
+                "effective_date": "2026-01-01",
+                "description": "x",
+                "sources": [
+                    {
+                        "kind": "cloudwatch",
+                        "namespace": "AWS/States",
+                        "metric": "ExecutionsSucceeded",
+                        "window_days": window_days,
+                        "dimensions": {
+                            "StateMachineArn": ["alpha-engine-saturday-pipeline"]
+                        },
+                        "assert": {"op": "success_rate_pct_gte", "value": 99},
+                    }
+                ],
+            }
+        ],
+    }
+    cw = StubCloudWatch()
+    cw.set_stats(
+        namespace="AWS/States",
+        metric="ExecutionsSucceeded",
+        dimensions=[("StateMachineArn", "alpha-engine-saturday-pipeline")],
+        datapoints=[{"Sum": 100.0}],
+    )
+    cw.set_stats(
+        namespace="AWS/States",
+        metric="ExecutionsFailed",
+        dimensions=[("StateMachineArn", "alpha-engine-saturday-pipeline")],
+        datapoints=[{"Sum": 0.0}],
+    )
+    check_inventory(
+        "weekly", today=date(2026, 6, 1), inventory=inv,
+        s3_client=StubS3(), cloudwatch_client=cw,
+    )
+    assert cw.get_calls, "expected at least one get_metric_statistics call"
+    for call in cw.get_calls:
+        period = call["Period"]
+        assert period >= 60, f"Period={period} below 60s minimum"
+        assert period % 60 == 0, (
+            f"Period={period} for window_days={window_days} is not a multiple "
+            f"of 60 — AWS GetMetricStatistics will reject this"
+        )
+
+
+@pytest.mark.parametrize("window_days", [1, 7, 14, 28])
+def test_cloudwatch_datapoints_period_is_multiple_of_60(window_days):
+    """Same multiple-of-60 invariant for the datapoints_gte assertion path
+    (used by agent_quality row in the inventory)."""
+    inv = {
+        "version": 1,
+        "inventory": [
+            {
+                "id": "row",
+                "cadence": "weekly",
+                "effective_date": "2026-01-01",
+                "description": "x",
+                "sources": [
+                    {
+                        "kind": "cloudwatch",
+                        "namespace": "AlphaEngine/Eval",
+                        "metric": "agent_quality_score_4w_mean_min",
+                        "window_days": window_days,
+                        "assert": {"op": "datapoints_gte", "value": 1},
+                    }
+                ],
+            }
+        ],
+    }
+    cw = StubCloudWatch()
+    cw.set_stats(
+        namespace="AlphaEngine/Eval",
+        metric="agent_quality_score_4w_mean_min",
+        datapoints=[{"SampleCount": 1.0}],
+    )
+    check_inventory(
+        "weekly", today=date(2026, 6, 1), inventory=inv,
+        s3_client=StubS3(), cloudwatch_client=cw,
+    )
+    assert cw.get_calls
+    for call in cw.get_calls:
+        period = call["Period"]
+        assert period >= 60
+        assert period % 60 == 0, (
+            f"Period={period} for window_days={window_days} is not a multiple "
+            f"of 60 (datapoints_gte path)"
+        )
 
 
 def test_cloudwatch_success_rate_fails_below_threshold():
