@@ -57,6 +57,56 @@ def test_schema_sql_packaged():
     assert "CREATE" in content.upper(), "schema.sql should contain DDL"
 
 
+def test_schema_sql_declares_hybrid_retrieval_surface():
+    """Hybrid retrieval (PR 1 of the BM25 + vector arc) requires
+    ``content_tsv`` + a GIN index on it. Pin both in schema.sql so a
+    future schema rewrite that drops them fails here instead of
+    silently regressing the keyword-side of retrieval to a sequential
+    scan.
+    """
+    import importlib.resources as ir
+
+    schema = (ir.files("alpha_engine_lib.rag") / "schema.sql").read_text()
+    assert "content_tsv" in schema, (
+        "schema.sql missing content_tsv generated column for hybrid retrieval"
+    )
+    assert "to_tsvector('english', content)" in schema, (
+        "content_tsv must use the english FTS config (matches Voyage's "
+        "single-language English embeddings)"
+    )
+    assert "GENERATED ALWAYS" in schema and "STORED" in schema, (
+        "content_tsv must be a STORED generated column so existing rows "
+        "auto-populate from content"
+    )
+    assert "USING gin (content_tsv)" in schema, (
+        "GIN index on content_tsv missing — keyword retrieval would fall "
+        "back to a sequential scan"
+    )
+
+
+def test_migration_0001_packaged_and_idempotent():
+    """0001_content_tsv.sql ships as package data and uses idempotent
+    DDL so re-runs against an already-migrated DB are no-ops.
+    """
+    import importlib.resources as ir
+
+    files = ir.files("alpha_engine_lib.rag")
+    migration = files / "migrations" / "0001_content_tsv.sql"
+    assert migration.is_file(), (
+        "migrations/0001_content_tsv.sql should ship as package data "
+        "(check pyproject.toml::tool.setuptools.package-data)"
+    )
+
+    content = migration.read_text()
+    # Idempotency markers — re-running the migration must be a no-op.
+    assert "ADD COLUMN IF NOT EXISTS content_tsv" in content, (
+        "migration must use ADD COLUMN IF NOT EXISTS for idempotency"
+    )
+    assert "CREATE INDEX IF NOT EXISTS chunks_content_tsv_gin" in content, (
+        "migration must use CREATE INDEX IF NOT EXISTS for idempotency"
+    )
+
+
 def test_is_available_safe_when_db_unreachable(monkeypatch):
     """is_available() must never raise — it's a probe, not an assertion."""
     from alpha_engine_lib.rag import is_available
