@@ -33,11 +33,17 @@ inventory:
         metric: ExecutionsSucceeded
         # Validated against ExecutionsFailed for ratio. Per-state machine
         # success rate computed over a 7-day trailing window.
+        #
+        # AWS/States dimension Value is the full state machine ARN, not
+        # just the SF name — GetMetricStatistics filters by exact
+        # dimension-value match, so short names return zero datapoints.
+        # Verified via `aws cloudwatch list-metrics --namespace AWS/States`
+        # 2026-05-08 after the lib v0.5.3 Period fix unmasked this drift.
         dimensions:
           StateMachineArn:
-            - alpha-engine-saturday-pipeline
-            - alpha-engine-weekday-pipeline
-            - alpha-engine-eod-pipeline
+            - arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-saturday-pipeline
+            - arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-weekday-pipeline
+            - arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-eod-pipeline
         window_days: 7
         assert:
           op: success_rate_pct_gte
