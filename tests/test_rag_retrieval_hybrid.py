@@ -277,5 +277,10 @@ class TestSQLShape:
         assert "ts_rank_cd" in captured["sql"]
         assert "plainto_tsquery('english'" in captured["sql"]
         assert "content_tsv @@" in captured["sql"]
+        # OR-relaxed tsquery — plainto_tsquery's default & semantics
+        # rewritten to | so natural-language queries don't zero out.
+        # See _keyword_search docstring.
+        assert "to_tsquery('english'" in captured["sql"]
+        assert "' & ', ' | '" in captured["sql"]
         # No vector fragments.
         assert "<=>" not in captured["sql"]
