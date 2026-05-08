@@ -163,22 +163,41 @@ def _keyword_search(
     """PostgreSQL Full-Text Search top-K via ``ts_rank_cd`` over the GIN
     index on ``content_tsv``. May return fewer than ``top_k`` rows when
     the corpus has fewer matches.
+
+    OR-relaxed tsquery: ``plainto_tsquery`` defaults to AND-of-all-terms,
+    which zeros out natural-language queries like "ABBV competitive moat
+    in immunology" — no chunk contains all four stemmed terms even
+    though each term individually has 100s-1000s of hits. We rewrite
+    the query to OR-of-terms so any chunk with at least one term is a
+    candidate, then rely on ``ts_rank_cd`` to surface chunks with the
+    most overlap + best proximity at the top. Standard RAG candidate-
+    generation pattern (recall at the gate, precision via the ranker).
+    Verified empirically against the prod corpus — AND mode returned
+    0-3 hits per typical qual-analyst query; OR + ts_rank_cd returns
+    1k-16k candidates with the genuinely-relevant chunks ranked at top.
     """
     from .db import get_connection
 
+    # OR-relaxed tsquery via PG's own parser:
+    #   plainto_tsquery handles tokenize + stem + stopword removal,
+    #   then replace its default '&' with '|' for OR semantics.
+    or_tsquery = (
+        "to_tsquery('english', "
+        "replace(plainto_tsquery('english', %s)::text, ' & ', ' | '))"
+    )
+
     where, params = _build_metadata_where(tickers, doc_types, min_date)
-    # FTS-side WHERE is appended onto the metadata WHERE (or starts a new one).
-    fts_clause = "c.content_tsv @@ plainto_tsquery('english', %s)"
+    fts_clause = f"c.content_tsv @@ {or_tsquery}"
     if where:
         where = f"{where} AND {fts_clause}"
     else:
         where = f"WHERE {fts_clause}"
     rank_params: list = [query]   # ts_rank_cd query in SELECT
-    fts_params: list = [query]    # tsquery in WHERE
+    fts_params: list = [query]    # OR-tsquery in WHERE
     order_params: list = [top_k]
     sql = f"""
         SELECT c.id, c.content, d.ticker, d.doc_type, d.filed_date, c.section_label,
-               ts_rank_cd(c.content_tsv, plainto_tsquery('english', %s)) AS rank
+               ts_rank_cd(c.content_tsv, {or_tsquery}) AS rank
         FROM rag.chunks c
         JOIN rag.documents d ON c.document_id = d.id
         {where}
