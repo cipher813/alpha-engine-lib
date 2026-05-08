@@ -161,6 +161,34 @@ def test_data_quality_row_matches_actual_parquet_columns():
     assert "source" in cols  # core attribution column from data #159
 
 
+def test_pipeline_execution_row_uses_full_state_machine_arns():
+    """Regression for the 2026-05-08 drift surfaced by the lib v0.5.3
+    Period fix: AWS/States dimension Value is the full ARN, not the
+    short SF name. GetMetricStatistics filters by exact dimension-value
+    match, so short names returned zero datapoints and the row reported
+    ``no datapoints in window`` for all three pipelines despite the SFs
+    succeeding."""
+    inv = load_inventory()
+    row = next(r for r in inv["inventory"] if r["id"] == "pipeline_execution")
+    src = row["sources"][0]
+    assert src["kind"] == "cloudwatch"
+    arns = src["dimensions"]["StateMachineArn"]
+    assert len(arns) == 3
+    expected_suffixes = {
+        "alpha-engine-saturday-pipeline",
+        "alpha-engine-weekday-pipeline",
+        "alpha-engine-eod-pipeline",
+    }
+    for arn in arns:
+        assert arn.startswith("arn:aws:states:"), (
+            f"StateMachineArn must be a full ARN, got {arn!r} — short SF "
+            "names return zero datapoints from GetMetricStatistics"
+        )
+        assert ":stateMachine:" in arn
+    suffixes = {arn.rsplit(":", 1)[-1] for arn in arns}
+    assert suffixes == expected_suffixes
+
+
 # ---------------------------------------------------------------------------
 # check_inventory: cadence filtering + effective_date gating
 # ---------------------------------------------------------------------------
