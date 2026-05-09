@@ -65,6 +65,39 @@ extraction, so the raw schema only enumerates the three values the LLM
 is allowed to emit."""
 
 
+CIORuleTagLiteral = Literal[
+    "qual_veto",
+    "quant_veto",
+    "dual_score_floor",
+    "rr_asymmetry",
+    "macro_alignment",
+    "portfolio_fit",
+    "catalyst_specificity",
+    "prior_continuity",
+    "other",
+]
+"""Per-decision attribution tag identifying which rule(s) drove the
+CIO's verdict. Vocabulary mirrors the prompt's EVALUATION CRITERIA
+(items 1-5) plus two implicit veto gates and a continuity tag:
+
+- ``qual_veto``         — qual_score < 50 trip
+- ``quant_veto``        — quant_score < 50 trip
+- ``dual_score_floor``  — both quant + qual < 60 with no compensating R/R
+- ``rr_asymmetry``      — R/R-ratio framing as primary justification
+- ``macro_alignment``   — sector under/overweight as primary factor
+- ``portfolio_fit``     — diversification, concentration, or already-held
+- ``catalyst_specificity`` — time-bound, named catalyst as primary factor
+- ``prior_continuity``  — prior IC continuity (rolled-over advance)
+- ``other``             — escape hatch for non-fitting reasoning
+
+Multiple tags per decision are allowed (a REJECT can be both
+``qual_veto`` AND ``macro_alignment``). Optional list[str] | None on
+the schema — None means the LLM didn't emit tags (legacy artifacts
+from before the v0.7.0 prompt update). Backtester analysis (per-tag
+precision over time) reads this field to surface which gates are
+systematically over- or under-rejecting."""
+
+
 # ── Quant analyst (sector_quant) ─────────────────────────────────────────
 
 
@@ -355,6 +388,15 @@ class CIORawDecision(BaseModel):
     rank: int | None = Field(default=None, ge=0, description="1-based rank for ADVANCE picks; null for REJECT / NO_ADVANCE_DEADLOCK.")
     conviction: int | None = Field(default=None, ge=0, le=100, description="Strength of view (0-100).")
     rationale: str = Field(default="", description="Why this decision — name R/R reasoning (sub-scores, rr_ratio, catalyst).")
+    rule_tags: list[CIORuleTagLiteral] | None = Field(
+        default=None,
+        description=(
+            "Which gating rule(s) drove this decision. ≥1 tag per decision "
+            "in v1.3.0+ prompts; multiple tags allowed (a REJECT can be "
+            "both qual_veto AND macro_alignment). None on legacy artifacts "
+            "from prompts < v1.3.0."
+        ),
+    )
     entry_thesis: HeldThesisUpdateLLMOutput | None = Field(default=None, description="Required for ADVANCE; null for REJECT / NO_ADVANCE_DEADLOCK.")
 
 
