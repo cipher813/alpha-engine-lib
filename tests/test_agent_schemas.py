@@ -261,6 +261,64 @@ class TestCIORawOutput:
                 {"ticker": "X", "decision": "MAYBE"},  # not in literal
             ])
 
+    def test_rule_tags_optional_default_none(self):
+        """Legacy artifacts emitted by prompts < v1.3.0 omit rule_tags
+        entirely. Schema must default to None so loading historical
+        captures keeps working."""
+        from alpha_engine_lib.agent_schemas import CIORawOutput
+
+        out = CIORawOutput(decisions=[
+            {"ticker": "NVDA", "decision": "ADVANCE",
+             "rank": 1, "conviction": 85, "rationale": "RR 2.5"},
+        ])
+        assert out.decisions[0].rule_tags is None
+
+    def test_rule_tags_accepts_single_tag(self):
+        from alpha_engine_lib.agent_schemas import CIORawOutput
+
+        out = CIORawOutput(decisions=[
+            {"ticker": "MCD", "decision": "REJECT",
+             "rationale": "Qual<50", "rule_tags": ["qual_veto"]},
+        ])
+        assert out.decisions[0].rule_tags == ["qual_veto"]
+
+    def test_rule_tags_accepts_multiple_tags(self):
+        """Real-world example: REJECT MCD because BOTH qual<50 AND
+        Consumer Discretionary is underweight. Multi-tag is the
+        common case for REJECTS."""
+        from alpha_engine_lib.agent_schemas import CIORawOutput
+
+        out = CIORawOutput(decisions=[
+            {"ticker": "MCD", "decision": "REJECT",
+             "rationale": "Qual<50 + sector underweight",
+             "rule_tags": ["qual_veto", "macro_alignment"]},
+        ])
+        assert out.decisions[0].rule_tags == ["qual_veto", "macro_alignment"]
+
+    def test_rule_tags_rejects_unknown_literal(self):
+        """Vocabulary is closed — unknown tags must fail validation
+        rather than silently accumulate as freeform strings."""
+        from alpha_engine_lib.agent_schemas import CIORawOutput
+
+        with pytest.raises(ValidationError):
+            CIORawOutput(decisions=[
+                {"ticker": "X", "decision": "REJECT",
+                 "rule_tags": ["made_up_tag"]},
+            ])
+
+    def test_rule_tag_vocabulary_is_nine_tags(self):
+        """Locked vocabulary — adding/removing a tag is a deliberate
+        prompt-version + analysis-layer change, not an accident."""
+        from alpha_engine_lib.agent_schemas import CIORuleTagLiteral
+        from typing import get_args
+
+        tags = set(get_args(CIORuleTagLiteral))
+        assert tags == {
+            "qual_veto", "quant_veto", "dual_score_floor",
+            "rr_asymmetry", "macro_alignment", "portfolio_fit",
+            "catalyst_specificity", "prior_continuity", "other",
+        }
+
 
 # ── LLM-as-judge eval ────────────────────────────────────────────────────
 
