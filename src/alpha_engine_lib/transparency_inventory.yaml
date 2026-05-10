@@ -229,3 +229,32 @@ inventory:
         assert:
           op: datapoints_gte
           value: 1
+
+  - id: cost_telemetry
+    cadence: weekly
+    # Per-run LLM cost telemetry workstream shipped via alpha-engine-
+    # research PR #73 (merged 2026-05-01). The first Saturday SF run
+    # that captured a ``cost.parquet`` was 2026-05-02. Consumers
+    # (backtester ``analysis/cost_report.detect_anomaly``) read this
+    # field as the floor of the rolling baseline window so pre-launch
+    # Saturdays are not classified as "capture-flag-off" gaps.
+    effective_date: 2026-05-02
+    description: >-
+      Per-Saturday LLM cost capture parquet aggregating per-call
+      JSONL writes. One row per agent invocation with token totals
+      (input / output / cache_read / cache_create) and computed
+      ``cost_usd``. Consumed by the evaluator's anomaly detector +
+      the cost report section of the Saturday SF email.
+    sources:
+      - kind: s3_parquet
+        bucket: alpha-engine-research
+        key_pattern: decision_artifacts/_cost/{date}/cost.parquet
+        max_age_days: 8
+        assert_columns_present:
+          - schema_version
+          - run_id
+          - agent_id
+          - model_name
+          - cost_usd
+        assert_column_non_null:
+          - cost_usd
