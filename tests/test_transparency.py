@@ -93,7 +93,7 @@ def test_inventory_yaml_loads_and_is_well_formed():
     inv = load_inventory()
     assert inv["version"] == 1
     assert isinstance(inv["inventory"], list)
-    assert len(inv["inventory"]) == 9
+    assert len(inv["inventory"]) == 10
     ids = {row["id"] for row in inv["inventory"]}
     expected = {
         "pipeline_execution",
@@ -105,6 +105,7 @@ def test_inventory_yaml_loads_and_is_well_formed():
         "config_changes",
         "data_quality",
         "agent_quality",
+        "cost_telemetry",
     }
     assert ids == expected
 
@@ -159,6 +160,41 @@ def test_data_quality_row_matches_actual_parquet_columns():
         "regression of the 2026-05-06 inventory drift"
     )
     assert "source" in cols  # core attribution column from data #159
+
+
+def test_cost_telemetry_row_pins_producer_contract():
+    """Cost telemetry was added 2026-05-10 as a substrate row so the
+    backtester's cost_report.detect_anomaly can read the registry's
+    effective_date as the anomaly-baseline floor (rather than infer it
+    from S3 listing). Pin the row's producer contract so a producer
+    schema drift surfaces at the substrate check, not silently in
+    downstream baseline classification.
+    """
+    inv = load_inventory()
+    row = next(
+        (r for r in inv["inventory"] if r["id"] == "cost_telemetry"), None,
+    )
+    assert row is not None, (
+        "cost_telemetry row is required; consumers (backtester "
+        "detect_anomaly) read effective_date from this registry"
+    )
+    assert row["cadence"] == "weekly"
+    # Saturday SF cron produces the parquet — first capture was 5/2.
+    assert str(row["effective_date"]) == "2026-05-02"
+    src = row["sources"][0]
+    assert src["kind"] == "s3_parquet"
+    assert src["bucket"] == "alpha-engine-research"
+    assert src["key_pattern"] == (
+        "decision_artifacts/_cost/{date}/cost.parquet"
+    )
+    cols = src["assert_columns_present"]
+    # Producer contract surface from llm_cost_tracker._PER_CALL_SCHEMA
+    # — a missing column on this list means the row was edited but the
+    # producer contract drifted.
+    for required in ("schema_version", "run_id", "agent_id",
+                     "model_name", "cost_usd"):
+        assert required in cols, f"cost_telemetry must check {required!r}"
+    assert "cost_usd" in src["assert_column_non_null"]
 
 
 def test_pipeline_execution_row_uses_full_state_machine_arns():
