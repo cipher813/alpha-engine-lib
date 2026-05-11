@@ -44,7 +44,7 @@ import json
 import logging
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 # ── Literals ─────────────────────────────────────────────────────────────
@@ -63,6 +63,14 @@ layer's ``_parse_cio_response`` may synthesize ``ADVANCE_FORCED`` to
 fill below-floor open slots, but that synthesis happens AFTER the LLM
 extraction, so the raw schema only enumerates the three values the LLM
 is allowed to emit."""
+
+
+STANCE_NAMES: tuple[str, ...] = ("momentum", "value", "quality", "catalyst")
+"""Canonical ordering of stance names. Source of truth for both the
+``StanceLiteral`` type and ``StanceLoadings`` field iteration order.
+Pinning the tuple lets tests assert equality rather than set-equality,
+surfacing unintended reordering. Iteration is also the tie-break order
+for ``StanceLoadings.argmax()``."""
 
 
 StanceLiteral = Literal["momentum", "value", "quality", "catalyst"]
@@ -101,10 +109,73 @@ declaration task to the agents would also degrade focus on their
 core alpha-generation work.
 
 Closed set of 4 chosen deliberately — small enough for decisive
-classification, large enough to cover real strategies. No "mixed" /
-"other" option by design — the classifier's tiebreaker picks the
-most-distinctive feature.
+classification, large enough to cover real strategies. There is no
+"mixed" / "other" option on the discrete label because picks ARE
+naturally mixed — the ``StanceLoadings`` continuous emission below
+captures the mixed exposure faithfully; ``StanceLiteral`` is the
+``argmax(loadings)`` convenience label for simple consumers.
 """
+
+
+class StanceLoadings(BaseModel):
+    """Continuous per-stance loadings — institutional factor-model
+    pattern. Each field is in ``[0, 1]``; the four fields sum to ``1.0``.
+
+    Most picks have mixed factor exposure (e.g., 0.65 momentum +
+    0.20 quality + 0.10 value + 0.05 catalyst). Discrete labels force
+    an artificial single-choice when reality is mixed; this model
+    captures the mix faithfully.
+
+    Producer: the heuristic stance classifier in alpha-engine-predictor
+    (``model/stance_classifier.py``). Smooth functions over per-ticker
+    features produce raw scores; ``softmax`` normalizes to a proper
+    probability distribution.
+
+    Consumers:
+      - **Simple consumers** (executor v1, dashboards): use
+        ``StanceLiteral`` (``argmax(loadings)``) instead and route to
+        one gate. No need to read this model.
+      - **Nuanced consumers** (backtester per-loading attribution,
+        future weighted-gate executor v2, future ML stance classifier):
+        read this model and weight gates / sizing / attribution by
+        each loading.
+
+    The discrete-vs-continuous split lets us ship the simple
+    consumer path now (v1 routes by argmax) while leaving the
+    institutional-grade continuous data on predictions.json for
+    later sophistication (no future schema migration required).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    momentum: float = Field(ge=0.0, le=1.0, description="Trending-up factor loading")
+    value: float = Field(ge=0.0, le=1.0, description="Oversold-but-defensible factor loading")
+    quality: float = Field(ge=0.0, le=1.0, description="Low-vol / defensive factor loading")
+    catalyst: float = Field(ge=0.0, le=1.0, description="Event-driven factor loading")
+
+    @model_validator(mode="after")
+    def _check_sum_to_one(self):
+        """Loadings must form a proper probability distribution. 1e-3
+        tolerance accommodates float roundoff in softmax + the producer's
+        rounding-to-6-decimals on serialization."""
+        total = self.momentum + self.value + self.quality + self.catalyst
+        if not (0.999 < total < 1.001):
+            raise ValueError(
+                f"stance_loadings must sum to 1.0 (±1e-3); got {total:.6f}"
+            )
+        return self
+
+    def argmax(self) -> StanceLiteral:
+        """Convenience: return the dominant stance label (highest
+        loading). Ties broken in canonical ``STANCE_NAMES`` order. Used
+        by executor v1 + dashboards for single-label routing."""
+        pairs = (
+            ("momentum", self.momentum),
+            ("value", self.value),
+            ("quality", self.quality),
+            ("catalyst", self.catalyst),
+        )
+        return max(pairs, key=lambda p: p[1])[0]  # type: ignore[return-value]
 
 
 CIORuleTagLiteral = Literal[
