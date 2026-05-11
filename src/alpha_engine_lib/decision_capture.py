@@ -23,10 +23,13 @@ prompt + input data snapshot + agent output + cost so each decision can be:
 - :exc:`DecisionCaptureWriteError` — raised by ``capture_decision`` on
   S3 failure (do not swallow).
 
-**Schema versioning rule:** ``schema_version`` is fixed to ``1``;
-fields are additive-only. Any rename or removal triggers ``schema_version=2``
-plus a backward-read compat layer in the wrapper. New fields can land on v1
-with sensible defaults — they don't break existing consumers.
+**Schema versioning rule:** ``schema_version`` accepts ``1`` (legacy
+LLM-only artifacts, pre-2026-05-11) or ``2`` (current — adds support for
+deterministic decisions with ``model_metadata = None`` and
+``full_prompt_context = None``). New writes go out as v2. Reads accept
+either. Fields are additive-only within a version; any rename or removal
+would trigger ``schema_version=3``. Use :func:`is_llm_decision` to
+discriminate LLM vs deterministic artifacts at read time.
 
 **Compatibility posture:** the top-level ``DecisionArtifact`` model is
 ``extra="forbid"`` (the contract is locked); the per-agent ``input_data_snapshot``
@@ -47,7 +50,7 @@ from typing import Any, Literal
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 logger = logging.getLogger(__name__)
 
@@ -120,16 +123,22 @@ class DecisionArtifact(BaseModel):
 
     Fields:
 
-    - ``schema_version``: locked at 1; fields are additive-only.
+    - ``schema_version``: ``1`` (legacy LLM-only) or ``2`` (current —
+      supports deterministic decisions with ``model_metadata=None`` +
+      ``full_prompt_context=None``). New writes go out as v2.
     - ``run_id``: unique per pipeline invocation; ties multiple agents'
       artifacts together for one Saturday SF run or weekday morning run.
     - ``timestamp``: ISO-8601 capture time (wall clock at the moment the
       wrapper writes to S3).
     - ``agent_id``: identifies which agent produced this — e.g.
       ``"sector_quant"``, ``"sector_qual"``, ``"macro_economist"``,
-      ``"ic_cio"``.
-    - ``model_metadata``: model + version + cost.
-    - ``full_prompt_context``: prompt + tool definitions.
+      ``"ic_cio"``, ``"executor:entry_triggers"``, ``"executor:risk_guard"``.
+    - ``model_metadata``: model + version + cost. ``None`` for
+      deterministic decisions (e.g. ``executor:*`` algorithmic agents).
+      Required-paired with ``full_prompt_context``: both present or both
+      ``None``, never half-populated.
+    - ``full_prompt_context``: prompt + tool definitions. ``None`` for
+      deterministic decisions. Required-paired with ``model_metadata``.
     - ``input_data_snapshot``: full input payload the agent saw at
       decision time (market state, portfolio state, retrieved RAG chunks,
       etc.). Truncated to fit ``_INPUT_SNAPSHOT_DEFAULT_CAP_BYTES`` if
@@ -143,21 +152,66 @@ class DecisionArtifact(BaseModel):
       if truncation fired; None otherwise.
     - ``agent_output``: serialized agent output dict (typed Pydantic
       model dumped via ``model_dump()``). Includes reasoning, tool
-      calls, final structured decision.
+      calls, final structured decision. For deterministic decisions,
+      the decision verdict (chosen trigger / sizing / veto verdict).
+
+    Use :func:`is_llm_decision` to discriminate LLM vs deterministic at
+    read time — consumers (cost telemetry, replay harness, LLM-as-judge,
+    rationale clustering) gate on it to skip deterministic rows.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal[1] = 1
+    schema_version: Literal[1, 2] = 2
     run_id: str
     timestamp: str  # ISO-8601, e.g. "2026-04-29T22:30:00.000Z"
     agent_id: str
-    model_metadata: ModelMetadata
-    full_prompt_context: FullPromptContext
+    model_metadata: ModelMetadata | None = None
+    full_prompt_context: FullPromptContext | None = None
     input_data_snapshot: dict[str, Any]
     input_data_summary: str | None = None
     input_data_truncated_at: int | None = Field(default=None, ge=0)
     agent_output: dict[str, Any]
+
+    @model_validator(mode="after")
+    def _llm_fields_paired(self) -> "DecisionArtifact":
+        """``model_metadata`` and ``full_prompt_context`` must both be
+        present (LLM agent) or both be ``None`` (deterministic decision).
+
+        Catches the silent-bug case where an LLM-agent producer accidentally
+        omits one of the two fields. Deterministic-producer callers pass
+        ``None`` for both, explicitly, by convention.
+        """
+        if (self.model_metadata is None) != (self.full_prompt_context is None):
+            raise ValueError(
+                "model_metadata and full_prompt_context must both be "
+                "present (LLM agent) or both be None (deterministic "
+                "decision); got "
+                f"model_metadata={'set' if self.model_metadata is not None else 'None'}, "
+                f"full_prompt_context={'set' if self.full_prompt_context is not None else 'None'}."
+            )
+        return self
+
+
+def is_llm_decision(artifact: DecisionArtifact) -> bool:
+    """True iff ``artifact`` was produced by an LLM agent (vs a deterministic
+    decision).
+
+    Consumers gate on this to skip rows they can't or shouldn't process:
+
+    - **Cost telemetry** — skips deterministic rows ($0 cost, 0 tokens).
+    - **Replay harness** — deterministic decisions don't replay through an
+      LLM model; dispatch to a different replay path (or skip).
+    - **LLM-as-judge** — judge has nothing to evaluate without a prompt.
+    - **Rationale clustering** — clustering needs the reasoning text inside
+      ``agent_output``, which deterministic rows don't carry.
+
+    Discrimination rule: ``model_metadata is not None``. The
+    :meth:`DecisionArtifact._llm_fields_paired` validator guarantees that
+    ``model_metadata`` and ``full_prompt_context`` are both present or both
+    ``None``, so either field is sufficient to decide.
+    """
+    return artifact.model_metadata is not None
 
 
 # ── Truncation helper for the 1MB cap ─────────────────────────────────────
@@ -275,8 +329,8 @@ def capture_decision(
     *,
     run_id: str,
     agent_id: str,
-    model_metadata: ModelMetadata,
-    full_prompt_context: FullPromptContext,
+    model_metadata: ModelMetadata | None,
+    full_prompt_context: FullPromptContext | None,
     input_data_snapshot: dict[str, Any],
     agent_output: dict[str, Any],
     input_data_summary: str | None = None,
@@ -299,11 +353,17 @@ def capture_decision(
         multiple agents in one run together.
     agent_id
         Identifies which agent produced this — e.g. ``"sector_quant"``,
-        ``"sector_qual"``, ``"macro_economist"``, ``"ic_cio"``.
+        ``"sector_qual"``, ``"macro_economist"``, ``"ic_cio"``,
+        ``"executor:entry_triggers"``, ``"executor:risk_guard"``.
     model_metadata
-        Model identifier + token counts + cost.
+        Model identifier + token counts + cost. Pass ``None`` for
+        deterministic decisions (e.g. ``executor:*`` algorithmic agents).
+        Must be paired with ``full_prompt_context`` — both ``None`` or
+        both populated; half-populated raises.
     full_prompt_context
         System prompt + user prompt + tool definitions seen by the agent.
+        Pass ``None`` for deterministic decisions; paired with
+        ``model_metadata``.
     input_data_snapshot
         Full input payload — load-bearing for replay correctness. Will
         be truncated to ``snapshot_cap_bytes`` if oversized; truncation

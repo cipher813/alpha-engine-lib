@@ -28,6 +28,7 @@ from alpha_engine_lib.decision_capture import (
     _build_s3_key,
     _serialized_size,
     capture_decision,
+    is_llm_decision,
     truncate_snapshot,
 )
 
@@ -151,15 +152,24 @@ def _minimal_artifact_kwargs() -> dict:
 class TestDecisionArtifactBasics:
     def test_minimal(self):
         art = DecisionArtifact(**_minimal_artifact_kwargs())
-        assert art.schema_version == 1
+        # v0.10.0 (schema_version=2) default — new writes go out as v2.
+        assert art.schema_version == 2
         assert art.input_data_summary is None
         assert art.input_data_truncated_at is None
 
-    def test_schema_version_pinned_to_1(self):
-        # Future-proofing: any attempt to set schema_version=2 must fail
-        # until a v2 schema actually ships.
+    def test_schema_version_v1_accepted_for_legacy_reads(self):
+        # Legacy v1 artifacts (pre-2026-05-11) must still validate so the
+        # historical corpus remains readable after the v2 bump.
         kwargs = _minimal_artifact_kwargs()
-        kwargs["schema_version"] = 2
+        kwargs["schema_version"] = 1
+        art = DecisionArtifact(**kwargs)
+        assert art.schema_version == 1
+
+    def test_schema_version_v3_rejected(self):
+        # Future-proofing: only v1 and v2 are valid. A future v3 bump would
+        # update this test alongside the schema change.
+        kwargs = _minimal_artifact_kwargs()
+        kwargs["schema_version"] = 3
         with pytest.raises(ValueError):
             DecisionArtifact(**kwargs)
 
@@ -192,6 +202,137 @@ class TestDecisionArtifactBasics:
         }
         art = DecisionArtifact(**kwargs)
         assert "tool_calls" in art.agent_output
+
+
+def _minimal_deterministic_kwargs() -> dict:
+    """Helper: minimal valid kwargs for a deterministic decision (v2 only).
+
+    ``model_metadata`` and ``full_prompt_context`` both ``None`` — produced
+    by an algorithmic agent (e.g. ``executor:entry_triggers``).
+    """
+    return {
+        "run_id": "run-2026-05-11",
+        "timestamp": "2026-05-11T20:30:00Z",
+        "agent_id": "executor:entry_triggers",
+        "model_metadata": None,
+        "full_prompt_context": None,
+        "input_data_snapshot": {
+            "ticker": "AAPL",
+            "current_price": 175.25,
+            "day_high": 178.50,
+            "thresholds": {"pullback_pct": 0.02},
+        },
+        "agent_output": {
+            "fired_trigger": "pullback 1.8% from high $178.50",
+            "trigger_kind": "pullback",
+        },
+    }
+
+
+class TestDecisionArtifactDeterministic:
+    """v0.10.0 — deterministic decisions (no LLM): both LLM fields are None."""
+
+    def test_minimal_deterministic(self):
+        art = DecisionArtifact(**_minimal_deterministic_kwargs())
+        assert art.schema_version == 2
+        assert art.model_metadata is None
+        assert art.full_prompt_context is None
+        assert art.agent_id == "executor:entry_triggers"
+
+    def test_half_populated_model_metadata_raises(self):
+        # model_metadata set + full_prompt_context None → validator fires
+        kwargs = _minimal_deterministic_kwargs()
+        kwargs["model_metadata"] = ModelMetadata(model_name="claude-haiku-4-5")
+        # full_prompt_context stays None
+        with pytest.raises(ValueError, match="must both be"):
+            DecisionArtifact(**kwargs)
+
+    def test_half_populated_prompt_context_raises(self):
+        # full_prompt_context set + model_metadata None → validator fires
+        kwargs = _minimal_deterministic_kwargs()
+        kwargs["full_prompt_context"] = FullPromptContext(
+            system_prompt="sys", user_prompt="user",
+        )
+        # model_metadata stays None
+        with pytest.raises(ValueError, match="must both be"):
+            DecisionArtifact(**kwargs)
+
+    def test_both_populated_is_valid(self):
+        # LLM agent path — both LLM fields populated, decision validates.
+        kwargs = _minimal_deterministic_kwargs()
+        kwargs["model_metadata"] = ModelMetadata(model_name="claude-haiku-4-5")
+        kwargs["full_prompt_context"] = FullPromptContext(
+            system_prompt="sys", user_prompt="user",
+        )
+        art = DecisionArtifact(**kwargs)
+        assert art.model_metadata is not None
+        assert art.full_prompt_context is not None
+
+    def test_deterministic_round_trip_json(self):
+        # Deterministic artifact survives model_dump_json() → model_validate_json().
+        original = DecisionArtifact(**_minimal_deterministic_kwargs())
+        roundtripped = DecisionArtifact.model_validate_json(original.model_dump_json())
+        assert roundtripped == original
+        assert roundtripped.model_metadata is None
+        assert roundtripped.full_prompt_context is None
+
+
+class TestIsLLMDecision:
+    """``is_llm_decision`` helper — consumers gate on it to skip deterministic rows."""
+
+    def test_llm_agent_returns_true(self):
+        art = DecisionArtifact(**_minimal_artifact_kwargs())
+        assert is_llm_decision(art) is True
+
+    def test_deterministic_returns_false(self):
+        art = DecisionArtifact(**_minimal_deterministic_kwargs())
+        assert is_llm_decision(art) is False
+
+    def test_discriminator_is_model_metadata(self):
+        # Documented behavior: the discriminator key is ``model_metadata is not None``.
+        # Pin this so a future refactor can't silently switch to checking the
+        # other paired field (full_prompt_context) — they're equivalent today
+        # thanks to the paired-presence validator, but the convention is to
+        # check model_metadata.
+        llm_art = DecisionArtifact(**_minimal_artifact_kwargs())
+        det_art = DecisionArtifact(**_minimal_deterministic_kwargs())
+        assert is_llm_decision(llm_art) == (llm_art.model_metadata is not None)
+        assert is_llm_decision(det_art) == (det_art.model_metadata is not None)
+
+
+class TestCaptureDecisionDeterministic:
+    """``capture_decision`` accepts None for the LLM fields and writes
+    a v2 artifact to S3 cleanly."""
+
+    @mock_aws
+    def test_capture_with_none_llm_fields(self):
+        # Set up moto S3 bucket.
+        s3 = boto3.client("s3", region_name="us-east-1")
+        s3.create_bucket(Bucket="alpha-engine-research")
+
+        # Capture a deterministic decision.
+        s3_key = capture_decision(
+            run_id="run-2026-05-11",
+            agent_id="executor:entry_triggers",
+            model_metadata=None,
+            full_prompt_context=None,
+            input_data_snapshot={"ticker": "AAPL", "current_price": 175.25},
+            agent_output={"fired_trigger": "pullback", "trigger_kind": "pullback"},
+            s3_client=s3,
+            timestamp=datetime(2026, 5, 11, 20, 30, 0, tzinfo=timezone.utc),
+        )
+
+        # Verify object lands at the canonical path.
+        assert s3_key == "decision_artifacts/2026/05/11/executor:entry_triggers/run-2026-05-11.json"
+        body = s3.get_object(Bucket="alpha-engine-research", Key=s3_key)["Body"].read()
+        artifact = DecisionArtifact.model_validate_json(body)
+
+        # The persisted artifact carries None for both LLM fields.
+        assert artifact.schema_version == 2
+        assert artifact.model_metadata is None
+        assert artifact.full_prompt_context is None
+        assert artifact.agent_id == "executor:entry_triggers"
+        assert is_llm_decision(artifact) is False
 
 
 class TestDecisionArtifactRoundTrip:
