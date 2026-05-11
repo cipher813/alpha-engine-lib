@@ -71,6 +71,53 @@ class TestQualAnalystOutput:
         assert out.additional_candidate.ticker == "MRK"
 
 
+# ── Stance taxonomy (v0.9.0) ─────────────────────────────────────────────
+
+
+class TestStanceLiteral:
+    """Schema-level pin on the 4-stance closed vocabulary.
+
+    Origin: 2026-05-11 stance taxonomy arc. Stance is DERIVED
+    downstream of agents (heuristic classifier in alpha-engine-predictor
+    reads per-ticker features + FMP catalyst calendar, emits the label
+    on predictions.json) — not declared by sector-team agents. The lib
+    owns the shared vocabulary so the predictor (emitter) and executor
+    (consumer) can pin the same Literal type.
+
+    See StanceLiteral docstring in agent_schemas.py + the gitignored
+    plan doc alpha-engine-docs/private/stance-taxonomy-arc-260511.md.
+    """
+
+    def test_stance_literal_has_exactly_four_values(self):
+        """Closed set of 4 is the load-bearing design decision —
+        adding a 5th stance would mean classifier rules need a new
+        branch AND executor gates need a new code path. Lock the
+        cardinality so a future PR can't quietly slip in a new option
+        without surfacing the cross-repo impact."""
+        import typing
+        from alpha_engine_lib.agent_schemas import StanceLiteral
+        args = typing.get_args(StanceLiteral)
+        assert args == ("momentum", "value", "quality", "catalyst"), (
+            f"StanceLiteral cardinality drift: got {args}. Adding/removing "
+            "a stance requires coordinated changes in the predictor "
+            "classifier rules, the executor gates, and the backtester per-"
+            "stance attribution. Don't bypass that coordination."
+        )
+
+    def test_stance_literal_values_are_lowercase_singular(self):
+        """Consumers (predictor classifier, executor gates, backtester
+        attribution) match on exact strings. Pin the case + form so a
+        future ``Momentum``/``MOMENTUM`` or ``momenta`` drift doesn't
+        silently break consumers via missed string match."""
+        import typing
+        from alpha_engine_lib.agent_schemas import StanceLiteral
+        for v in typing.get_args(StanceLiteral):
+            assert v == v.lower(), f"stance vocabulary not lowercase: {v!r}"
+            assert not v.endswith("s"), (
+                f"stance vocabulary should be singular: {v!r}"
+            )
+
+
 # ── Peer review ──────────────────────────────────────────────────────────
 
 
