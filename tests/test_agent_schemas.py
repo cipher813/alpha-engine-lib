@@ -117,6 +117,102 @@ class TestStanceLiteral:
                 f"stance vocabulary should be singular: {v!r}"
             )
 
+    def test_stance_names_tuple_matches_literal(self):
+        """STANCE_NAMES is the canonical iteration order. Must match
+        StanceLiteral exactly so the discrete label, continuous
+        loadings, and iteration order all align."""
+        import typing
+        from alpha_engine_lib.agent_schemas import STANCE_NAMES, StanceLiteral
+        assert STANCE_NAMES == typing.get_args(StanceLiteral)
+
+
+class TestStanceLoadings:
+    """Continuous stance loadings — institutional factor-model pattern.
+
+    Each pick gets a 4-element softmax over stance scores instead of a
+    forced single-label assignment. Simple consumers fall back to
+    ``.argmax()`` for a single StanceLiteral label; nuanced consumers
+    (backtester per-loading attribution, future weighted-gate executor)
+    read all four loadings.
+    """
+
+    def test_typical_payload_round_trips(self):
+        import json
+        from alpha_engine_lib.agent_schemas import StanceLoadings
+
+        s = StanceLoadings(momentum=0.65, value=0.10, quality=0.20, catalyst=0.05)
+        blob = s.model_dump_json()
+        s2 = StanceLoadings.model_validate(json.loads(blob))
+        assert s2.momentum == pytest.approx(0.65)
+        assert s2.value == pytest.approx(0.10)
+        assert s2.quality == pytest.approx(0.20)
+        assert s2.catalyst == pytest.approx(0.05)
+
+    def test_loadings_must_sum_to_one(self):
+        from alpha_engine_lib.agent_schemas import StanceLoadings
+
+        # Sum = 0.5 → reject
+        with pytest.raises(ValidationError, match="sum to 1"):
+            StanceLoadings(momentum=0.5, value=0.0, quality=0.0, catalyst=0.0)
+        # Sum = 1.5 → reject
+        with pytest.raises(ValidationError, match="sum to 1"):
+            StanceLoadings(momentum=0.5, value=0.5, quality=0.5, catalyst=0.0)
+
+    def test_loadings_tolerate_float_roundoff(self):
+        """Producer rounds to 6 decimals + softmax involves exp/sum
+        which doesn't yield exact 1.0. Allow ±1e-3 tolerance so the
+        producer's rounding doesn't trigger spurious validation
+        failures."""
+        from alpha_engine_lib.agent_schemas import StanceLoadings
+
+        # Slightly off from 1.0 (4e-4 short) — accept
+        s = StanceLoadings(momentum=0.2500, value=0.2500, quality=0.2499, catalyst=0.2497)
+        assert abs((s.momentum + s.value + s.quality + s.catalyst) - 1.0) < 1e-3
+
+    def test_negative_loadings_rejected(self):
+        """Each loading is a probability — must be ≥ 0."""
+        from alpha_engine_lib.agent_schemas import StanceLoadings
+
+        with pytest.raises(ValidationError):
+            StanceLoadings(momentum=-0.1, value=0.5, quality=0.4, catalyst=0.2)
+
+    def test_argmax_returns_dominant_stance(self):
+        """The .argmax() convenience method returns the StanceLiteral
+        label of the highest-loaded stance. Simple consumers
+        (executor v1) use this; nuanced consumers read all four
+        loadings directly."""
+        from alpha_engine_lib.agent_schemas import StanceLoadings
+
+        s = StanceLoadings(momentum=0.65, value=0.10, quality=0.20, catalyst=0.05)
+        assert s.argmax() == "momentum"
+
+        s = StanceLoadings(momentum=0.10, value=0.65, quality=0.20, catalyst=0.05)
+        assert s.argmax() == "value"
+
+        s = StanceLoadings(momentum=0.05, value=0.10, quality=0.20, catalyst=0.65)
+        assert s.argmax() == "catalyst"
+
+    def test_argmax_tie_broken_by_canonical_order(self):
+        """Ties broken by STANCE_NAMES order (momentum > value >
+        quality > catalyst). Deterministic + matches the lib's
+        canonical iteration."""
+        from alpha_engine_lib.agent_schemas import StanceLoadings
+
+        s = StanceLoadings(momentum=0.25, value=0.25, quality=0.25, catalyst=0.25)
+        assert s.argmax() == "momentum"  # first in canonical order
+
+    def test_extra_fields_rejected(self):
+        """extra='forbid' guards the schema — typo in field name (e.g.,
+        ``momentmu=0.5``) fails validation rather than silently being
+        stored on an attribute the consumer never reads."""
+        from alpha_engine_lib.agent_schemas import StanceLoadings
+
+        with pytest.raises(ValidationError):
+            StanceLoadings.model_validate({
+                "momentum": 0.65, "value": 0.10, "quality": 0.20,
+                "catalyst": 0.05, "momentmu": 0.0,  # typo
+            })
+
 
 # ── Peer review ──────────────────────────────────────────────────────────
 
