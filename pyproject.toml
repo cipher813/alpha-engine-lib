@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "alpha-engine-lib"
-version = "0.10.0"
+version = "0.11.0"
 description = "Shared utilities for Alpha Engine modules — preflight, logging, ArcticDB, dates, calendar, decision capture, cost tracking, RAG, agent output schemas, and transparency-substrate health checks"
 readme = "README.md"
 # EC2 still runs Python 3.9 on the always-on micro instance (boto3 drops
@@ -27,6 +27,13 @@ rag = [
     "psycopg2-binary>=2.9",
     "pgvector>=0.2",
     "numpy>=1.24",
+]
+# Cross-encoder rerank dependency. Pulls torch + transformers + the
+# ~600MB BAAI bge-reranker-v2-m3 model on first use. Kept as a
+# separate extra so vector/hybrid-only consumers don't pay the install
+# cost.
+rerank = [
+    "sentence-transformers>=3.0",
 ]
 dev = [
     "pytest>=7.0",

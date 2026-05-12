@@ -46,6 +46,8 @@ class RetrievalResult:
     vector_score: float | None = None    # cosine similarity, [-1, 1]; None if not retrieved via vector
     keyword_score: float | None = None   # ts_rank_cd, [0, ∞); None if not retrieved via keyword
     combined_score: float | None = None  # blended score in hybrid mode; None for non-hybrid
+    rerank_score: float | None = None    # cross-encoder / LLM-judge score; None if rerank wasn't run
+    rerank_method: str | None = None     # "cross_encoder" / "llm_judge" / None — disambiguates which reranker stamped this
 
 
 def retrieve(
@@ -57,6 +59,8 @@ def retrieve(
     *,
     method: RetrievalMethod = "vector",
     vector_weight: float = 0.7,
+    rerank: str | None = None,
+    rerank_input_n: int = 30,
 ) -> list[RetrievalResult]:
     """Retrieve the most relevant chunks for a natural language query.
 
@@ -72,30 +76,73 @@ def retrieve(
         vector_weight: Hybrid blend weight on the vector side, in [0, 1].
             ``vector_weight=1.0`` ≡ pure vector; ``0.0`` ≡ pure keyword.
             Ignored for non-hybrid methods.
+        rerank: When set, run a reranker over the retrieved candidates
+            before truncating to ``top_k``. Supported values:
+            ``"cross_encoder"`` (local BAAI bge-reranker-v2-m3 — default
+            choice when reranking, no API cost) or ``"llm_judge"``
+            (Anthropic Haiku with a 1-5 relevance rubric — opt-in,
+            higher latency + cost). ``None`` (default) preserves the
+            pre-rerank behavior — back-compat path for callers not yet
+            wired to reranking.
+        rerank_input_n: When ``rerank`` is set, retrieve this many
+            candidates from the underlying method before passing the
+            pool to the reranker. Larger pools give the reranker more
+            room to find precision; default of 30 matches the standard
+            production RAG pattern (retrieve-50 / rerank-to-10 is the
+            published baseline, scaled down here for the typical
+            ticker-pre-filtered query that returns fewer hits to begin
+            with). Ignored when ``rerank`` is ``None``.
 
     Returns:
         List of RetrievalResult sorted by similarity descending. For hybrid
         results, ``similarity`` carries the blended score and the per-side
         components are exposed via ``vector_score`` / ``keyword_score``.
+        When rerank is set, results are reordered by ``rerank_score``
+        (highest first) and the score + method are stamped onto each
+        result.
     """
     if method not in ("vector", "keyword", "hybrid"):
         raise ValueError(f"unknown method: {method!r}")
     if not 0.0 <= vector_weight <= 1.0:
         raise ValueError(f"vector_weight must be in [0,1]; got {vector_weight}")
+    if rerank is not None and rerank_input_n < top_k:
+        raise ValueError(
+            f"rerank_input_n ({rerank_input_n}) must be >= top_k ({top_k}); "
+            "otherwise the rerank pool can't yield enough survivors."
+        )
+
+    # When reranking, fetch a wider candidate pool from the underlying
+    # method so the reranker has room to surface precision wins.
+    retrieve_k = rerank_input_n if rerank is not None else top_k
 
     if method == "vector":
-        results = _vector_search(query, tickers, doc_types, min_date, top_k)
+        results = _vector_search(query, tickers, doc_types, min_date, retrieve_k)
     elif method == "keyword":
-        results = _keyword_search(query, tickers, doc_types, min_date, top_k)
+        results = _keyword_search(query, tickers, doc_types, min_date, retrieve_k)
     else:
-        # Hybrid — retrieve top_k from each side, blend the union, return top_k overall.
-        v = _vector_search(query, tickers, doc_types, min_date, top_k)
-        k = _keyword_search(query, tickers, doc_types, min_date, top_k)
-        results = _blend(v, k, vector_weight=vector_weight, top_k=top_k)
+        # Hybrid — retrieve retrieve_k from each side, blend the union, return retrieve_k overall.
+        v = _vector_search(query, tickers, doc_types, min_date, retrieve_k)
+        k = _keyword_search(query, tickers, doc_types, min_date, retrieve_k)
+        results = _blend(v, k, vector_weight=vector_weight, top_k=retrieve_k)
+
+    n_pre_rerank = len(results)
+
+    if rerank is not None and results:
+        # Imported lazily so a bare ``from alpha_engine_lib.rag import
+        # retrieve`` keeps the sentence-transformers / torch install
+        # optional. The reranker is registered + memoized at module
+        # scope so repeat calls within a Lambda container share the
+        # model handle + the in-process score cache.
+        from .rerank import get_reranker
+        reranker = get_reranker(rerank)
+        results = reranker.rerank(query, results, top_k=top_k)
 
     logger.info(
-        "RAG retrieve: query=%r method=%s tickers=%s top_k=%d → %d results",
-        query[:60], method, tickers, top_k, len(results),
+        "RAG retrieve: query=%r method=%s tickers=%s top_k=%d rerank=%s "
+        "rerank_input_n=%d → %d candidates → %d results",
+        query[:60], method, tickers, top_k, rerank,
+        rerank_input_n if rerank is not None else 0,
+        n_pre_rerank, len(results),
     )
     return results
 
