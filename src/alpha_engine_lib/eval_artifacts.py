@@ -90,7 +90,13 @@ Example::
 """
 from __future__ import annotations
 
+import json
+import logging
 from datetime import datetime, timezone
+from typing import Any
+
+
+logger = logging.getLogger(__name__)
 
 
 # Stable filename for the operator-UX single-fetch sidecar. Constant
@@ -198,3 +204,158 @@ def eval_latest_key(prefix: str) -> str:
         S3 key string for the latest sidecar.
     """
     return f"{prefix.strip('/')}/{EVAL_LATEST_FILENAME}"
+
+
+# ─ Canonical readers ──────────────────────────────────────────────────
+# Symmetric counterpart to the write helpers above. Multiple repos
+# need to read eval-artifact-shaped artifacts (regime substrate from
+# research + predictor + executor + dashboard; future eval pipelines
+# similarly) — these helpers are the single source of truth for the
+# sidecar-resolution + history-listing patterns so consumers don't
+# each reimplement them with slightly different fail-graceful semantics.
+
+
+def load_latest_eval_artifact(
+    s3_client: Any,
+    *,
+    bucket: str,
+    prefix: str,
+) -> dict | None:
+    """Load the most recent eval-style artifact via canonical sidecar pointer.
+
+    Resolution sequence (all-or-nothing, returns None on any failure):
+
+    1. ``s3_client.get_object`` on ``{prefix}/latest.json``
+    2. Parse sidecar JSON, extract ``artifact_key``
+    3. ``s3_client.get_object`` on the artifact key
+    4. Parse + return the artifact payload
+
+    Returns ``None`` and logs at INFO level on any failure mode:
+    missing sidecar, malformed sidecar, missing artifact_key in
+    sidecar, missing artifact body, parse errors, transient S3 hiccups.
+    Callers handle the None case to fall back to whatever default
+    behavior makes sense for their domain (regime substrate: macro
+    agent falls back to LLM + post-LLM-guardrail; etc.).
+
+    The ``s3_client`` parameter is a boto3-like S3 client — any object
+    that responds to ``get_object(Bucket=, Key=)`` with a dict whose
+    ``Body`` field is readable. Pass a real ``boto3.client("s3")`` in
+    production, or an in-memory stub in tests.
+
+    Args:
+        s3_client: boto3-like S3 client.
+        bucket: S3 bucket name (e.g. ``"alpha-engine-research"``).
+        prefix: S3 prefix root for the pipeline (e.g. ``"regime"``,
+            ``"predictor/variant_gates/triple_barrier"``).
+
+    Returns:
+        Parsed artifact payload dict, or ``None`` if unavailable.
+    """
+    sidecar_key = eval_latest_key(prefix)
+    try:
+        sidecar_obj = s3_client.get_object(Bucket=bucket, Key=sidecar_key)
+        sidecar = json.loads(sidecar_obj["Body"].read())
+    except Exception as e:
+        logger.info(
+            "[load_latest_eval_artifact] sidecar read failed at s3://%s/%s (%s) — "
+            "no artifact available yet",
+            bucket, sidecar_key, type(e).__name__,
+        )
+        return None
+
+    artifact_key = sidecar.get("artifact_key") if isinstance(sidecar, dict) else None
+    if not artifact_key:
+        logger.warning(
+            "[load_latest_eval_artifact] sidecar at s3://%s/%s lacks artifact_key",
+            bucket, sidecar_key,
+        )
+        return None
+
+    try:
+        body_obj = s3_client.get_object(Bucket=bucket, Key=artifact_key)
+        return json.loads(body_obj["Body"].read())
+    except Exception as e:
+        logger.warning(
+            "[load_latest_eval_artifact] artifact body read failed at s3://%s/%s (%s)",
+            bucket, artifact_key, type(e).__name__,
+        )
+        return None
+
+
+def list_eval_artifacts(
+    s3_client: Any,
+    *,
+    bucket: str,
+    prefix: str,
+    n_recent: int | None = None,
+) -> list[dict]:
+    """List eval-style artifacts under ``prefix``, oldest → newest by run_id.
+
+    Lists ``{prefix}/{YYMMDDHHMM}.json`` keys (canonical eval_artifacts
+    shape — flat layout, no calendar_date sub-partition), filters out:
+
+    - the ``latest.json`` sidecar (pure pointer, not an artifact)
+    - any nested keys (none expected under the canonical shape)
+    - filenames that aren't 10-digit run_ids (defensive — catches
+      accidentally-written files)
+    - non-``.json`` files
+
+    Sorts lexicographically by run_id (= chronological since the
+    timestamp encoding is left-padded), then loads up to ``n_recent``
+    most-recent payloads. ``n_recent=None`` returns all.
+
+    Partial progress on fetch failures — one S3 hiccup on a single
+    artifact doesn't drop the rest of the window. Failed reads are
+    logged at WARNING and silently skipped.
+
+    Args:
+        s3_client: boto3-like S3 client.
+        bucket: S3 bucket name.
+        prefix: S3 prefix root for the pipeline.
+        n_recent: Cap on number of most-recent artifacts to load.
+            ``None`` = all. Default ``None``.
+
+    Returns:
+        List of parsed artifact payload dicts, oldest → newest.
+        Empty list when no artifacts exist (pre-deploy state).
+    """
+    prefix_clean = prefix.strip("/")
+    list_prefix = f"{prefix_clean}/"
+
+    try:
+        paginator = s3_client.get_paginator("list_objects_v2")
+        run_ids: list[tuple[str, str]] = []  # (run_id, artifact_key)
+        for page in paginator.paginate(Bucket=bucket, Prefix=list_prefix):
+            for obj in page.get("Contents", []):
+                key = obj.get("Key", "")
+                rel = key[len(list_prefix):]
+                if "/" in rel or not rel.endswith(".json"):
+                    continue
+                run_id = rel[:-len(".json")]
+                if run_id == "latest" or not run_id.isdigit() or len(run_id) != 10:
+                    continue
+                run_ids.append((run_id, key))
+    except Exception as e:
+        logger.warning(
+            "[list_eval_artifacts] listing failed at s3://%s/%s (%s)",
+            bucket, list_prefix, type(e).__name__,
+        )
+        return []
+
+    run_ids.sort()  # lexicographic = chronological with YYMMDDHHMM
+    if n_recent is not None and len(run_ids) > n_recent:
+        run_ids = run_ids[-n_recent:]
+
+    out: list[dict] = []
+    for _run_id, key in run_ids:
+        try:
+            body_obj = s3_client.get_object(Bucket=bucket, Key=key)
+            out.append(json.loads(body_obj["Body"].read()))
+        except Exception as e:
+            logger.warning(
+                "[list_eval_artifacts] body read failed at s3://%s/%s (%s) — "
+                "skipping this artifact",
+                bucket, key, type(e).__name__,
+            )
+            continue
+    return out

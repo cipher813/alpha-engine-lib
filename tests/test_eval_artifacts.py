@@ -156,3 +156,146 @@ class TestEvalLatestKey:
         # Constant is part of the public API so dashboards / scripts
         # can hard-code the filename without re-inventing it.
         assert EVAL_LATEST_FILENAME == "latest.json"
+
+
+# ─ Reader tests ──────────────────────────────────────────────────────
+
+
+import io as _io
+import json as _json
+from unittest.mock import MagicMock as _MagicMock
+
+from alpha_engine_lib.eval_artifacts import (
+    list_eval_artifacts,
+    load_latest_eval_artifact,
+)
+
+
+class _FakeS3:
+    """Minimal in-memory S3 stub for reader tests — supports get_object
+    and a paginator for list_objects_v2."""
+
+    def __init__(self) -> None:
+        self.objects: dict[tuple[str, str], bytes] = {}
+
+    def put_json(self, bucket: str, key: str, payload: dict) -> None:
+        self.objects[(bucket, key)] = _json.dumps(payload).encode("utf-8")
+
+    def get_object(self, *, Bucket: str, Key: str) -> dict:
+        if (Bucket, Key) not in self.objects:
+            raise KeyError(f"no object at {Bucket}/{Key}")
+        return {"Body": _io.BytesIO(self.objects[(Bucket, Key)])}
+
+    def get_paginator(self, op: str):
+        assert op == "list_objects_v2"
+        paginator = _MagicMock()
+        contents = [{"Key": k} for (_, k) in self.objects.keys()]
+        paginator.paginate.return_value = [{"Contents": contents}]
+        return paginator
+
+
+class TestLoadLatestEvalArtifact:
+
+    def test_resolves_sidecar_to_artifact(self):
+        s3 = _FakeS3()
+        s3.put_json("buck", "regime/latest.json", {
+            "run_id": "2605170230",
+            "artifact_key": "regime/2605170230.json",
+        })
+        s3.put_json("buck", "regime/2605170230.json", {
+            "run_id": "2605170230",
+            "hmm": {"argmax": "neutral"},
+        })
+        result = load_latest_eval_artifact(s3, bucket="buck", prefix="regime")
+        assert result["run_id"] == "2605170230"
+        assert result["hmm"]["argmax"] == "neutral"
+
+    def test_returns_none_when_sidecar_missing(self):
+        s3 = _FakeS3()
+        assert load_latest_eval_artifact(s3, bucket="buck", prefix="regime") is None
+
+    def test_returns_none_when_sidecar_lacks_artifact_key(self):
+        s3 = _FakeS3()
+        s3.put_json("buck", "regime/latest.json", {"run_id": "2605170230"})
+        assert load_latest_eval_artifact(s3, bucket="buck", prefix="regime") is None
+
+    def test_returns_none_when_artifact_body_missing(self):
+        """Sidecar points at a key that doesn't exist (transient hiccup
+        or partial publish). Loader returns None instead of crashing."""
+        s3 = _FakeS3()
+        s3.put_json("buck", "regime/latest.json", {
+            "artifact_key": "regime/2605170230.json",
+        })
+        assert load_latest_eval_artifact(s3, bucket="buck", prefix="regime") is None
+
+    def test_prefix_with_trailing_slash_normalized(self):
+        """Trailing/leading slashes on prefix shouldn't matter."""
+        s3 = _FakeS3()
+        s3.put_json("buck", "regime/latest.json", {"artifact_key": "regime/X.json"})
+        s3.put_json("buck", "regime/X.json", {"k": "v"})
+        assert load_latest_eval_artifact(s3, bucket="buck", prefix="regime/")["k"] == "v"
+
+
+class TestListEvalArtifacts:
+
+    def test_lists_chronologically(self):
+        s3 = _FakeS3()
+        # Three artifacts out of order
+        s3.put_json("buck", "regime/2605170230.json", {"run_id": "2605170230"})
+        s3.put_json("buck", "regime/2604120230.json", {"run_id": "2604120230"})
+        s3.put_json("buck", "regime/2604260230.json", {"run_id": "2604260230"})
+        s3.put_json("buck", "regime/latest.json", {"artifact_key": "regime/2605170230.json"})
+        results = list_eval_artifacts(s3, bucket="buck", prefix="regime")
+        assert [r["run_id"] for r in results] == [
+            "2604120230", "2604260230", "2605170230",
+        ]
+
+    def test_takes_only_n_recent(self):
+        s3 = _FakeS3()
+        for m in range(1, 11):
+            run_id = f"26{m:02d}010230"
+            s3.put_json("buck", f"regime/{run_id}.json", {"run_id": run_id})
+        results = list_eval_artifacts(s3, bucket="buck", prefix="regime", n_recent=3)
+        assert len(results) == 3
+        assert [r["run_id"] for r in results] == [
+            "2608010230", "2609010230", "2610010230",
+        ]
+
+    def test_skips_sidecar_and_nonconforming_keys(self):
+        s3 = _FakeS3()
+        s3.put_json("buck", "regime/2605170230.json", {"run_id": "2605170230"})
+        s3.put_json("buck", "regime/latest.json", {"artifact_key": "x"})
+        # Non-conforming keys — must all be skipped
+        s3.objects[("buck", "regime/notnumeric.json")] = b"{}"
+        s3.objects[("buck", "regime/12345.json")] = b"{}"        # wrong length
+        s3.objects[("buck", "regime/2605170230.parquet")] = b""  # wrong ext
+        s3.objects[("buck", "regime/sub/2605170230.json")] = b"{}"  # nested
+        results = list_eval_artifacts(s3, bucket="buck", prefix="regime")
+        assert len(results) == 1
+        assert results[0]["run_id"] == "2605170230"
+
+    def test_empty_when_no_artifacts(self):
+        s3 = _FakeS3()
+        assert list_eval_artifacts(s3, bucket="buck", prefix="regime") == []
+
+    def test_partial_progress_on_body_fetch_failures(self):
+        """One bad artifact body shouldn't drop the rest of the window."""
+        s3 = _FakeS3()
+        s3.put_json("buck", "regime/2604120230.json", {"run_id": "2604120230"})
+        s3.put_json("buck", "regime/2605170230.json", {"run_id": "2605170230"})
+        # Sidecar that says "middle" artifact exists but body is missing
+        # — list operation discovers all 3 keys, body fetch fails on middle.
+        original_get_object = s3.get_object
+
+        def _flaky_get(*, Bucket: str, Key: str):
+            if Key == "regime/2604260230.json":
+                raise KeyError("transient")
+            return original_get_object(Bucket=Bucket, Key=Key)
+
+        # Insert the middle key into objects so list sees it, but the
+        # body fetch will fail via our patched get_object.
+        s3.objects[("buck", "regime/2604260230.json")] = b"{}"
+        s3.get_object = _flaky_get  # type: ignore[assignment]
+        results = list_eval_artifacts(s3, bucket="buck", prefix="regime")
+        run_ids = [r["run_id"] for r in results]
+        assert run_ids == ["2604120230", "2605170230"]

@@ -209,8 +209,12 @@ def test_class_missing_name_attr_is_not_subtype():
 
 
 def test_lib_version_bumped_to_0_15_0():
+    """Pin that the sources-Protocols feature has shipped (was 0.15.0).
+    Asserts >= so future version bumps don't break this gate while
+    still catching accidental version regressions below 0.15.0."""
+    from packaging.version import Version
     import alpha_engine_lib
-    assert alpha_engine_lib.__version__ == "0.15.0"
+    assert Version(alpha_engine_lib.__version__) >= Version("0.15.0")
 
 
 # ── Re-exports from package init ──────────────────────────────────────
