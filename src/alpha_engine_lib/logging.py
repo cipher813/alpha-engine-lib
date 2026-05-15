@@ -26,8 +26,15 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from datetime import datetime, timezone
 from typing import Optional
+
+# ``${VAR}`` interpolation tokens in a flow-doctor.yaml. flow-doctor
+# resolves these from ``os.environ`` eagerly at ``flow_doctor.init()``
+# time — before any lazy ``get_secret()`` consumer-site call runs — so
+# the seed below must populate them first.
+_FD_VAR_RE = re.compile(r"\$\{([A-Z][A-Z0-9_]*)\}")
 
 # Singleton populated by setup_logging() when FLOW_DOCTOR_ENABLED=1.
 # ``Optional[object]`` typing avoids forcing a flow_doctor import here.
@@ -57,6 +64,58 @@ def get_flow_doctor():
     return _fd_instance
 
 
+def _seed_flow_doctor_secrets(yaml_path: str) -> None:
+    """Populate the flow-doctor ``${VAR}`` secrets into ``os.environ``.
+
+    flow-doctor resolves every ``${VAR}`` in its yaml from ``os.environ``
+    eagerly inside ``flow_doctor.init()``, before any consumer-site
+    :func:`alpha_engine_lib.secrets.get_secret` call has had a chance to
+    run. With the legacy ``ssm_secrets.load_secrets()`` bulk-load shim
+    retired (PR 9g), systemd/Step-Functions-launched entrypoints have no
+    ``.env`` source, so those ``${VAR}`` refs would resolve to nothing
+    and flow-doctor's email + GitHub dispatch would silently misfire.
+
+    This is the single chokepoint every repo reaches flow-doctor
+    through, so seeding here closes the gap system-wide with no
+    per-repo code. The var set is derived from the yaml itself rather
+    than hardcoded — each repo's flow-doctor.yaml carries a different
+    ``${VAR}`` set, and a yaml-added secret must not silently re-open
+    the gap.
+
+    Invariants (mirroring the retired shim):
+
+    - A var already present in ``os.environ`` wins — never overwritten.
+    - A genuinely unresolvable secret is left **unset**, so
+      flow-doctor's own ``ConfigError`` fires loudly rather than being
+      masked with ``""`` (see ``feedback_no_silent_fails``).
+    - A secrets-backend hiccup never blocks logging setup; it is logged
+      at WARNING and the var is left unset (same loud-failure path).
+    """
+    try:
+        with open(yaml_path, "r", encoding="utf-8") as fh:
+            yaml_text = fh.read()
+    except OSError:
+        # Missing/unreadable yaml is reported by _attach_flow_doctor's
+        # own os.path.exists guard with a clearer message.
+        return
+
+    from alpha_engine_lib.secrets import get_secret
+
+    for var in sorted(set(_FD_VAR_RE.findall(yaml_text))):
+        if os.environ.get(var):
+            continue
+        try:
+            value = get_secret(var, required=False)
+        except Exception as exc:  # noqa: BLE001 - backend hiccup is non-fatal
+            logging.getLogger(__name__).warning(
+                "flow-doctor secret seed: get_secret(%s) raised %r; "
+                "leaving unset so flow-doctor fails loudly", var, exc,
+            )
+            continue
+        if value:
+            os.environ[var] = value
+
+
 def _attach_flow_doctor(
     yaml_path: str,
     exclude_patterns: list[str] | None = None,
@@ -84,6 +143,7 @@ def _attach_flow_doctor(
             f"FLOW_DOCTOR_ENABLED=1 but flow-doctor config not found at {yaml_path}"
         )
 
+    _seed_flow_doctor_secrets(yaml_path)
     _fd_instance = flow_doctor.init(config_path=yaml_path)
     handler_kwargs: dict = {"level": logging.ERROR}
     if exclude_patterns:
