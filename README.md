@@ -111,6 +111,30 @@ schema = resolve_schema_for_agent(agent_id)
 
 `SCHEMA_BY_AGENT_ID_BASE` covers the 6 canonical agent families: `sector_quant`, `sector_qual`, `sector_peer_review`, `macro_economist`, `ic_cio`, `thesis_update`. Validators that defend observed LLM failure modes (sector-modifier clamp, JSON-string-as-list parser, `min_length=1` on CIO decisions) move with their classes.
 
+### `pillars` — canonical 6-pillar attractiveness scoring shapes
+
+Pydantic shapes for the institutional / SOTA refactor of research-module composite scoring — replaces the opaque `quant_score + qual_score` two-bucket model with a canonical 6-pillar decomposition: **Quality / Value / Momentum / Growth / Stewardship / Defensiveness**. Pillar set is the AQR Style Premia / Morningstar Economic Moat / Greenblatt / Piotroski / Fama-French / Asness "QMJ" consensus.
+
+```python
+from alpha_engine_lib.pillars import (
+    PILLARS,
+    MoatAssessment,
+    PillarSubscore,
+    QualitativePillarAssessment,
+)
+
+# Qual Analyst emits via with_structured_output(QualitativePillarAssessment).
+# Each of the 6 PillarSubscore fields carries 0-100 + confidence + evidence;
+# the Quality pillar additionally carries a structured MoatAssessment
+# (Morningstar wide/narrow/none + 6-archetype primary moat type + trend) —
+# the qualitative core of Quality, persisted per ticker for time-series
+# trend tracking.
+```
+
+Each `PillarSubscore` decomposes into optional `quant_component` (from the factor substrate) + `qual_component` (from the agent rubric) for traceability through the composite scoring layer. Catalyst is preserved as an orthogonal `catalyst_horizon_modulation: int ∈ [-20, 20]` (a horizon shift on near-term attractiveness), not a 7th pillar weight.
+
+Origin: 2026-05-20 attractiveness-pillars-260520 plan-doc arc. Phase 1 (this module) ships the schema layer; Phases 2-7 wire it through alpha-engine-research, alpha-engine-data, alpha-engine-backtester, and alpha-engine-dashboard.
+
 ### `rag` — semantic retrieval over SEC filings, transcripts, and theses
 
 Neon pgvector backbone shared by `alpha-engine-research` (qual analyst's `query_filings` tool) and `alpha-engine-data` (weekly RAGIngestion step). Re-exports a small surface — `retrieve`, `ingest_document`, `document_exists`, `embed_texts`, `get_connection`, `is_available` — and ships the canonical `schema.sql` as package data.
