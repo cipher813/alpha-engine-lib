@@ -166,11 +166,34 @@ class TestPublish:
         assert len(subject) <= 100
         assert "\n" not in subject
 
-    def test_never_raises_on_publish_exception(self):
-        # Even with no creds + no mocks at all, publish must not raise.
-        result = alerts.publish("boom", source="test", sns_topic_arn=None)
-        # Either may fail; result is structured.
+    def test_never_raises_on_publish_exception(self, fake_boto3):
+        """``publish`` must NEVER raise — both channels can fail and the
+        function still returns a structured PublishResult.
+
+        Surfaced 2026-05-21 (post-v0.24.0 dedup PR): the prior version of
+        this test ran with no mocks at all, claiming "no creds + no
+        mocks" — but on a laptop with real AWS creds it actually
+        published to the live ``alpha-engine-alerts`` SNS topic, firing
+        a real ``[ERROR] test: boom`` email to the operator every time
+        ``pytest tests/test_alerts.py`` ran. Same defect class as the
+        2026-05-13 1015 USD cost-spike and the cost_report storm Brian
+        flagged earlier this session — test fixtures leaking into
+        production alert channels. The test still verifies the
+        never-raises contract, just with explicit boto3 + telegram
+        stubs that simulate the "both channels fail" case.
+        """
+        fake, _sts, sns = fake_boto3
+        sns.publish.side_effect = RuntimeError("simulated SNS unreachable")
+        with patch.dict("sys.modules", {"boto3": fake}):
+            with patch.object(
+                alerts, "_publish_telegram",
+                return_value=alerts.ChannelResult(ok=False, detail="simulated"),
+            ):
+                result = alerts.publish("boom", source="test", sns_topic_arn=None)
+        # Structured result returned despite both channels failing.
         assert isinstance(result, alerts.PublishResult)
+        assert result.any_ok is False
+        assert result.all_ok is False
 
 
 class TestCli:
