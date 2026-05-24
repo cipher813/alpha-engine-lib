@@ -1,5 +1,6 @@
 """
-dates.py — canonical "current date" attribution for trade-related artifacts.
+dates.py — canonical "current date" attribution + freshness checks for
+trade-related artifacts.
 
 Implements the dual-tracking convention from
 ``alpha-engine-docs/private/DATE_CONVENTIONS.md``: every trade-related
@@ -26,18 +27,38 @@ For backfilling historical rows that only have a wall-clock timestamp::
 
     trading_day = session_for_timestamp(row["created_at"])
 
+For freshness checks across the system, use the trading-day-aware helpers
+rather than calendar-day arithmetic::
+
+    from alpha_engine_lib.dates import is_fresh_in_trading_days
+
+    # Producer-side postflight: did macro.SPY land the most recent close?
+    if not is_fresh_in_trading_days(spy_last_date, run_date):
+        raise PostflightError(...)
+
+    # Consumer-side preflight: was the data refreshed within ≤1 trading day?
+    if not is_fresh_in_trading_days(ticker_last_date, today, max_stale=1):
+        raise PreflightError(...)
+
+The freshness helpers replace the calendar-day-arithmetic patterns that bit
+the 2026-05-24 SF recovery — every post-Saturday redrive trips a calendar-
+day gate even when the data carries the most recent NYSE close. Calendar
+days only happen to work on Saturday because Fri→Sat is +1 in both calendar
+and trading-day arithmetic. See [[feedback_lift_invariants_to_chokepoint
+_after_second_recurrence]] + [[feedback_sota_institutional_default_no_shortcuts]].
+
 This module is a thin wrapper over
-``alpha_engine_lib.trading_calendar.last_closed_trading_day`` — its purpose
-is to standardize the *output shape* (DualDate) and provide a single
-canonical entry point so every consumer sees the same semantics.
+``alpha_engine_lib.trading_calendar.{last_closed_trading_day,count_trading_days}``
+— its purpose is to standardize the *output shape* (DualDate) and provide a
+single canonical entry point so every consumer sees the same semantics.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timezone
 
-from .trading_calendar import last_closed_trading_day
+from .trading_calendar import count_trading_days, last_closed_trading_day
 
 
 @dataclass(frozen=True)
@@ -105,6 +126,123 @@ def now_dual(*, now: datetime | None = None) -> DualDate:
         calendar_date=cal_utc.isoformat(),
         trading_day=td.isoformat(),
     )
+
+
+# ── Freshness checks (trading-day-aware) ─────────────────────────────────────
+
+
+def expected_last_close(run_date: date | str) -> date:
+    """The most recent NYSE close that exists as of ``run_date``.
+
+    For Saturday/Sunday/holiday-Monday → the prior Friday (or earlier if a
+    holiday-adjacent week). For trading days → the same date (the day's close
+    has settled, anchored at end-of-day for the purpose of staleness checks).
+
+    This is the canonical reference point for "what's the freshest data we
+    could expect to see at this run_date?" — used by every producer-side
+    postflight + consumer-side preflight in the system.
+
+    Args:
+        run_date: ISO ``yyyy-mm-dd`` string OR a ``datetime.date``.
+
+    Returns:
+        The expected last-closed NYSE session date as a ``datetime.date``.
+
+    Example::
+
+        >>> from datetime import date
+        >>> expected_last_close(date(2026, 5, 24))  # Sunday
+        datetime.date(2026, 5, 22)
+        >>> expected_last_close("2026-05-25")  # Memorial Day (Mon)
+        datetime.date(2026, 5, 22)
+        >>> expected_last_close(date(2026, 5, 26))  # Tuesday after Memorial Day
+        datetime.date(2026, 5, 26)
+    """
+    if isinstance(run_date, str):
+        run_date = datetime.strptime(run_date, "%Y-%m-%d").date()
+    # Anchor at 23:00 UTC of run_date so the resolver sees that day's NYSE
+    # close as settled if run_date is itself a trading day. (NYSE close is
+    # 4 PM ET = 20-21 UTC depending on DST; 23 UTC is unambiguously after.)
+    anchor = datetime.combine(run_date, time(23, 0), tzinfo=timezone.utc)
+    return last_closed_trading_day(anchor)
+
+
+def trading_days_stale(last_date: date, reference: date | str) -> int:
+    """Number of NYSE trading sessions ``last_date`` is behind ``reference``.
+
+    Returns 0 when ``last_date`` is at or ahead of the reference's expected
+    last-closed trading day. Holiday-aware (NYSE calendar, not US Federal).
+
+    Semantically the canonical staleness metric for any "is this artifact
+    carrying the most recent close that exists?" check across the system.
+    Replaces the calendar-day arithmetic (``(reference - last_date).days``)
+    that breaks on every non-Saturday redrive.
+
+    Args:
+        last_date: the artifact's stored last_date (``datetime.date``).
+        reference: ISO ``yyyy-mm-dd`` string OR ``datetime.date`` — the
+            run_date or "today" against which freshness is being asked.
+
+    Returns:
+        Integer count of NYSE sessions in
+        ``(last_date, expected_last_close(reference)]``. Zero means
+        "carries the most recent available close." Positive means
+        "missed N sessions."
+
+    Example::
+
+        >>> from datetime import date
+        >>> trading_days_stale(date(2026, 5, 22), date(2026, 5, 24))  # Fri vs Sun
+        0
+        >>> trading_days_stale(date(2026, 5, 22), date(2026, 5, 25))  # Fri vs Memorial-Mon
+        0
+        >>> trading_days_stale(date(2026, 5, 22), date(2026, 5, 26))  # Fri vs Tue close
+        1
+        >>> trading_days_stale(date(2026, 5, 13), date(2026, 5, 22))  # Wed 5/13 vs Fri 5/22
+        7
+    """
+    expected = expected_last_close(reference)
+    if last_date >= expected:
+        return 0
+    return count_trading_days(last_date, expected)
+
+
+def is_fresh_in_trading_days(
+    last_date: date,
+    reference: date | str,
+    *,
+    max_stale: int = 0,
+) -> bool:
+    """Canonical freshness predicate: is ``last_date`` ≤ ``max_stale`` trading days behind ``reference``?
+
+    Default ``max_stale=0`` means "must carry the most recent NYSE close that
+    exists as of reference" — the strictest gate, used by producer-side
+    postflights where the producer just wrote and should be current.
+    ``max_stale=1`` tolerates one missing session — used by consumer-side
+    preflights that need to survive the T+1 latency of polygon's daily
+    aggregate publish.
+
+    Args:
+        last_date: artifact's stored last_date.
+        reference: run_date the freshness is being asked at.
+        max_stale: max permitted trading-day lag. Keyword-only to force
+            explicit semantics at every call site.
+
+    Returns:
+        ``True`` iff the artifact carries data within ``max_stale`` trading
+        days of the most recent NYSE close that exists as of ``reference``.
+
+    Example::
+
+        >>> from datetime import date
+        >>> is_fresh_in_trading_days(date(2026, 5, 22), date(2026, 5, 24))  # Fri vs Sun
+        True
+        >>> is_fresh_in_trading_days(date(2026, 5, 13), date(2026, 5, 22))  # 7-session lag
+        False
+        >>> is_fresh_in_trading_days(date(2026, 5, 13), date(2026, 5, 22), max_stale=10)
+        True
+    """
+    return trading_days_stale(last_date, reference) <= max_stale
 
 
 def session_for_timestamp(ts: datetime) -> str:
