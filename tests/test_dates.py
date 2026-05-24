@@ -164,3 +164,113 @@ class TestNowDualMatchesSessionForTimestamp:
     def test_agreement_on_mlk_holiday(self):
         ts = datetime(2026, 1, 19, 12, 0, tzinfo=_NYSE)
         assert now_dual(now=ts).trading_day == session_for_timestamp(ts)
+
+
+# ── Freshness helpers (trading-day-aware) ────────────────────────────────────
+
+
+from datetime import date as _date  # noqa: E402
+
+from alpha_engine_lib.dates import (  # noqa: E402
+    expected_last_close,
+    is_fresh_in_trading_days,
+    trading_days_stale,
+)
+
+
+class TestExpectedLastClose:
+    """``expected_last_close(run_date)`` returns the most recent NYSE close
+    that exists as of run_date — Friday on weekends, the day itself on a
+    settled trading day, the prior trading day on a holiday."""
+
+    def test_saturday_returns_friday(self):
+        assert expected_last_close(_date(2026, 5, 23)) == _date(2026, 5, 22)
+
+    def test_sunday_returns_friday(self):
+        # The 2026-05-24 SF recovery's exact reference point.
+        assert expected_last_close(_date(2026, 5, 24)) == _date(2026, 5, 22)
+
+    def test_memorial_day_monday_returns_prior_friday(self):
+        # Memorial Day 2026 = Mon 5/25 (NYSE closed).
+        assert expected_last_close(_date(2026, 5, 25)) == _date(2026, 5, 22)
+
+    def test_tuesday_after_memorial_day_returns_tuesday(self):
+        # Tuesday 5/26 — its own close has settled (we anchor at 23 UTC).
+        assert expected_last_close(_date(2026, 5, 26)) == _date(2026, 5, 26)
+
+    def test_accepts_iso_string(self):
+        assert expected_last_close("2026-05-24") == _date(2026, 5, 22)
+
+    def test_good_friday_walks_back_to_thursday(self):
+        # Good Friday 2026 = Apr 3 (NYSE closed).
+        assert expected_last_close(_date(2026, 4, 3)) == _date(2026, 4, 2)
+
+
+class TestTradingDaysStale:
+    """``trading_days_stale(last_date, reference)`` counts NYSE sessions
+    between last_date (exclusive) and the expected last close of reference
+    (inclusive). Zero when last_date carries the most recent available close."""
+
+    def test_saturday_redrive_friday_macro_is_zero(self):
+        # Original Saturday-SF semantic: Fri close on Sat run_date.
+        assert trading_days_stale(_date(2026, 5, 22), _date(2026, 5, 23)) == 0
+
+    def test_sunday_redrive_friday_macro_is_zero(self):
+        # The exact case that broke calendar-day arithmetic on 2026-05-24.
+        # Fri→Sun = 2 calendar days, 0 trading days.
+        assert trading_days_stale(_date(2026, 5, 22), _date(2026, 5, 24)) == 0
+
+    def test_memorial_day_monday_friday_macro_is_zero(self):
+        # Fri→Memorial-Mon = 3 calendar days, 0 trading days.
+        assert trading_days_stale(_date(2026, 5, 22), _date(2026, 5, 25)) == 0
+
+    def test_tuesday_after_memorial_day_expects_tuesday_close(self):
+        # Tuesday's close settled by 23 UTC ⇒ Friday macro is 1 session behind.
+        assert trading_days_stale(_date(2026, 5, 22), _date(2026, 5, 26)) == 1
+
+    def test_genuinely_stale_returns_session_count(self):
+        # Wed 5/13 → Fri 5/22 = 7 trading days (skipping the Sat/Sun weekend).
+        assert trading_days_stale(_date(2026, 5, 13), _date(2026, 5, 22)) == 7
+
+    def test_future_last_date_returns_zero(self):
+        # Defensive: last_date ahead of reference is treated as "fresh."
+        assert trading_days_stale(_date(2026, 5, 30), _date(2026, 5, 22)) == 0
+
+    def test_accepts_iso_string_reference(self):
+        assert trading_days_stale(_date(2026, 5, 22), "2026-05-24") == 0
+
+
+class TestIsFreshInTradingDays:
+    """``is_fresh_in_trading_days(last_date, reference, max_stale=N)`` is the
+    canonical freshness predicate. Default ``max_stale=0`` means "must carry
+    the most recent NYSE close that exists." Larger max_stale tolerates
+    publish-latency in consumer-side preflights (polygon T+1)."""
+
+    def test_default_strict_passes_on_sunday_with_friday_macro(self):
+        # The 2026-05-24 SF recovery: must pass under the new trading-day gate.
+        assert is_fresh_in_trading_days(_date(2026, 5, 22), _date(2026, 5, 24))
+
+    def test_default_strict_fails_when_one_session_behind(self):
+        # macro at Wed close, asking for Thursday's expected close.
+        assert not is_fresh_in_trading_days(_date(2026, 5, 13), _date(2026, 5, 14))
+
+    def test_max_stale_one_tolerates_t_plus_one_lag(self):
+        # Consumer-preflight pattern: tolerate 1-session lag for T+1 publish.
+        assert is_fresh_in_trading_days(
+            _date(2026, 5, 13), _date(2026, 5, 14), max_stale=1,
+        )
+
+    def test_max_stale_keyword_only(self):
+        import pytest
+        with pytest.raises(TypeError):
+            is_fresh_in_trading_days(  # type: ignore[call-arg]
+                _date(2026, 5, 22), _date(2026, 5, 24), 1,
+            )
+
+    def test_holiday_aware_via_nyse_calendar(self):
+        # Tue 5/26 — its own close has settled at 23 UTC, so Friday's macro
+        # is 1 session behind. max_stale=0 fails, max_stale=1 passes.
+        assert not is_fresh_in_trading_days(_date(2026, 5, 22), _date(2026, 5, 26))
+        assert is_fresh_in_trading_days(
+            _date(2026, 5, 22), _date(2026, 5, 26), max_stale=1,
+        )
