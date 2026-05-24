@@ -254,6 +254,24 @@ STATE_TO_ARCHIVE_PAGE: Final[dict[str, "ArchivePageRef | ArtifactReason"]] = {
         "Terminal failure SNS publish to alpha-engine-alerts; "
         "no persisted artifact (the email IS the surface)."
     ),
+    "PublishResearchFailureImmediate": ArtifactReason(
+        "Early-signal SNS publish fired the moment the Research branch "
+        "fails inside ResearchPredictorParallel — BEFORE the sibling "
+        "PredictorTraining branch completes its work and the parallel "
+        "aggregation joins. No persisted artifact (the email IS the "
+        "surface). Salvage-at-join semantics preserved: the branch still "
+        "terminates via BranchAFailed Pass and the SF fails at "
+        "CheckBranchOutcomes."
+    ),
+    "PublishPredictorFailureImmediate": ArtifactReason(
+        "Early-signal SNS publish fired the moment the PredictorTraining "
+        "branch fails inside ResearchPredictorParallel — BEFORE the "
+        "sibling Research branch's eval-judge / RollingMean / "
+        "Counterfactual chain completes. No persisted artifact (the "
+        "email IS the surface). Salvage-at-join semantics preserved: "
+        "the branch still terminates via BranchBFailed Pass and the SF "
+        "fails at CheckBranchOutcomes."
+    ),
     # ── Weekday SF (13 substantive Task steps) ───────────────────────────
     "DeployDriftCheck": ArchivePageRef(
         page="4_System_Health",
