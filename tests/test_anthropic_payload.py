@@ -30,6 +30,7 @@ from alpha_engine_lib.anthropic_payload import (
     DEFAULT_WEB_SEARCH_MAX_USES,
     SERVER_TOOL_PREFIXES,
     PayloadInvariantError,
+    build_batches_request_params,
     build_messages_payload,
     build_web_search_tool,
     validate_payload,
@@ -271,3 +272,119 @@ def test_build_messages_payload_morning_signal_replication():
     assert payload["tools"][0]["max_uses"] == 20
     assert len(payload["messages"]) == 1  # no assistant prefill
     assert opener in payload["messages"][0]["content"]
+
+
+# ── build_batches_request_params ─────────────────────────────────────────────
+
+
+_FORCE_TOOL_CHOICE = {"type": "tool", "name": "RubricEvalLLMOutput"}
+
+
+def _custom_tool_spec():
+    """A non-server-side tool — what the judge batch uses for structured output."""
+    return {
+        "name": "RubricEvalLLMOutput",
+        "description": "Emit the rubric eval payload as structured JSON.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"score": {"type": "integer"}},
+            "required": ["score"],
+        },
+    }
+
+
+def test_build_batches_request_params_judge_shape():
+    """Replicates the alpha-engine-research judge call shape: no system
+    prompt, custom tool, forced tool_choice, no caching. Locks the
+    minimal viable Batches request envelope the judge actually ships."""
+    req = build_batches_request_params(
+        custom_id="judge-abc-123",
+        model="claude-haiku-4-5",
+        max_tokens=2048,
+        user_content="Rubric prompt body here…",
+        tools=[_custom_tool_spec()],
+        tool_choice=_FORCE_TOOL_CHOICE,
+    )
+    assert req["custom_id"] == "judge-abc-123"
+    params = req["params"]
+    assert params["model"] == "claude-haiku-4-5"
+    assert params["max_tokens"] == 2048
+    assert params["messages"] == [{"role": "user", "content": "Rubric prompt body here…"}]
+    assert params["tools"] == [_custom_tool_spec()]
+    assert params["tool_choice"] == _FORCE_TOOL_CHOICE
+    # No system prompt by default — judge inlines rubric into user content.
+    assert "system" not in params
+
+
+def test_build_batches_request_params_with_system_prompt_no_cache_default():
+    """When a system prompt IS provided, it lands as a one-element system
+    array. Caching is OFF by default for batches per the docstring rationale."""
+    req = build_batches_request_params(
+        custom_id="x",
+        model="claude-sonnet-4-6",
+        max_tokens=256,
+        user_content="u",
+        system_prompt="You are a helpful assistant.",
+    )
+    sys_blocks = req["params"]["system"]
+    assert sys_blocks == [{"type": "text", "text": "You are a helpful assistant."}]
+    assert "cache_control" not in sys_blocks[0]
+
+
+def test_build_batches_request_params_with_system_prompt_cache_opt_in():
+    """``cache_system=True`` attaches ephemeral cache_control (the
+    opt-in path for batches with large repeated system prompts)."""
+    req = build_batches_request_params(
+        custom_id="x",
+        model="claude-sonnet-4-6",
+        max_tokens=256,
+        user_content="u",
+        system_prompt="Large repeated system prompt.",
+        cache_system=True,
+    )
+    assert req["params"]["system"][0]["cache_control"] == {"type": "ephemeral"}
+
+
+def test_build_batches_request_params_validates_server_tool_prefill_invariant():
+    """The Batches builder honors the same server-tool ⊥ assistant-prefill
+    invariant as the sync builder — caught via ``extra`` smuggling."""
+    with pytest.raises(PayloadInvariantError):
+        build_batches_request_params(
+            custom_id="x",
+            model="claude-sonnet-4-6",
+            max_tokens=256,
+            user_content="u",
+            tools=[build_web_search_tool()],
+            extra={
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": "Y"},
+                ]
+            },
+        )
+
+
+def test_build_batches_request_params_no_system_no_tools_minimal():
+    """Minimal shape: only model + max_tokens + messages. Pins that
+    optional fields don't leak ``None`` keys into the payload."""
+    req = build_batches_request_params(
+        custom_id="x",
+        model="claude-haiku-4-5",
+        max_tokens=64,
+        user_content="ping",
+    )
+    params = req["params"]
+    assert set(params.keys()) == {"model", "max_tokens", "messages"}
+
+
+def test_build_batches_request_params_extra_merges_into_params():
+    """``extra`` keys merge into ``params`` (e.g. metadata for batch-side
+    observability). Validation still runs."""
+    req = build_batches_request_params(
+        custom_id="x",
+        model="claude-haiku-4-5",
+        max_tokens=64,
+        user_content="u",
+        extra={"metadata": {"user_id": "judge-v3"}},
+    )
+    assert req["params"]["metadata"] == {"user_id": "judge-v3"}
