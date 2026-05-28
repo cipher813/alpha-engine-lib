@@ -215,3 +215,95 @@ def build_messages_payload(
 
     validate_payload(payload)
     return payload
+
+
+def build_batches_request_params(
+    *,
+    custom_id: str,
+    model: str,
+    max_tokens: int,
+    user_content: str,
+    tools: list[dict] | None = None,
+    tool_choice: dict[str, Any] | None = None,
+    system_prompt: str | None = None,
+    cache_system: bool = False,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Construct one entry of the ``messages.batches.create`` ``requests`` array.
+
+    The Anthropic Batches API takes a list of ``{"custom_id", "params"}``
+    dicts, where each ``params`` value is a kwargs dict for an underlying
+    ``messages.create()`` call. This helper builds one such entry,
+    validating the embedded payload via :func:`validate_payload`.
+
+    Differs from :func:`build_messages_payload` along three axes the
+    judge-batch path requires:
+
+    1. **Optional system prompt.** Synchronous callers nearly always have
+       a static system prompt (the lib default caches it); judge batches
+       inject the entire rubric into the user message and have no system
+       block. Pass ``system_prompt=None`` (the default) to emit no
+       system block at all.
+    2. **No cache_control by default.** The Batches API discounts every
+       call 50% before prompt caching applies; the marginal value of
+       caching is small enough that the existing judge path opts out.
+       ``cache_system=False`` is the default for this reason; pass
+       ``cache_system=True`` explicitly if the system prompt is large
+       enough to benefit.
+    3. **Explicit tool_choice.** Forced tool calls (
+       ``{"type": "tool", "name": ...}``) are the dominant Batches use
+       case (structured-output via a known schema). Pass ``tool_choice``
+       directly rather than smuggling through ``extra``.
+
+    All :func:`validate_payload` invariants run against the embedded
+    ``params`` — including the server-tool ⊥ assistant-prefill check —
+    so a future Batches caller that mixes ``web_search`` with a
+    prefill won't reach Anthropic's HTTP 400.
+
+    Args:
+        custom_id: Per-request identifier returned in the batch result.
+            Caller-owned; must be unique within a batch.
+        model: Anthropic model identifier (e.g. ``"claude-haiku-4-5"``).
+        max_tokens: ``max_tokens`` for the embedded call.
+        user_content: The user-message content (typically the full
+            rendered rubric / prompt body, since batch calls usually
+            omit the system block).
+        tools: Optional list of tool specs.
+        tool_choice: Optional tool-choice spec (e.g.
+            ``{"type": "tool", "name": "RubricEvalLLMOutput"}`` to force
+            structured output via a specific tool).
+        system_prompt: Optional system-prompt text. When ``None`` (the
+            default), no ``system`` block is emitted.
+        cache_system: When ``True``, attach ``cache_control: ephemeral``
+            to the system block. Default ``False`` because Batches
+            already discounts 50% and the marginal cache value is small.
+            Ignored when ``system_prompt is None``.
+        extra: Optional dict merged into ``params`` after construction
+            (e.g. ``metadata``, ``stop_sequences``). Validation runs
+            AFTER the merge.
+
+    Returns:
+        ``{"custom_id": custom_id, "params": <validated kwargs dict>}``,
+        ready to splat into ``messages.batches.create(requests=[...])``.
+
+    Raises :exc:`PayloadInvariantError` on a known-incompatible shape.
+    """
+    params: dict[str, Any] = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "messages": [{"role": "user", "content": user_content}],
+    }
+    if system_prompt is not None:
+        system_block: dict[str, Any] = {"type": "text", "text": system_prompt}
+        if cache_system:
+            system_block["cache_control"] = {"type": "ephemeral"}
+        params["system"] = [system_block]
+    if tools:
+        params["tools"] = list(tools)
+    if tool_choice is not None:
+        params["tool_choice"] = tool_choice
+    if extra:
+        params.update(extra)
+
+    validate_payload(params)
+    return {"custom_id": custom_id, "params": params}
