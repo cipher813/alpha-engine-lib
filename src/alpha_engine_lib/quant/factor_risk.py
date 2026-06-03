@@ -172,12 +172,14 @@ def portfolio_risk(model: FactorRiskModel, weights: dict[str, float]) -> dict:
     total_var = factor_var + idio_var
 
     contrib = x * fx  # per-factor variance contribution; Σ = factor_var
-    pct = {f: (float(c) / total_var if total_var > 0 else 0.0) for f, c in zip(model.factors, contrib, strict=True)}
+    # NB: zip() without strict= (added 3.10) — the lib targets 3.9; the iterables
+    # are equal-length by construction (factors, contrib, x, active are all length K).
+    pct = {f: (float(c) / total_var if total_var > 0 else 0.0) for f, c in zip(model.factors, contrib)}
     return {
         "total_vol": float(np.sqrt(max(total_var, 0.0) * ann)),
         "factor_vol": float(np.sqrt(max(factor_var, 0.0) * ann)),
         "idio_vol": float(np.sqrt(max(idio_var, 0.0) * ann)),
-        "factor_exposures": {f: float(v) for f, v in zip(model.factors, x, strict=True)},
+        "factor_exposures": {f: float(v) for f, v in zip(model.factors, x)},
         "factor_pct_contrib": pct,
         "idio_pct": (idio_var / total_var if total_var > 0 else 0.0),
     }
@@ -201,5 +203,5 @@ def tracking_error(model: FactorRiskModel, weights: dict[str, float], benchmark_
         "tracking_error": float(np.sqrt(max(te_var, 0.0) * ann)),
         "active_factor_vol": float(np.sqrt(max(active_factor_var, 0.0) * ann)),
         "active_idio_vol": float(np.sqrt(max(active_idio_var, 0.0) * ann)),
-        "active_exposures": {f: float(v) for f, v in zip(model.factors, active, strict=True)},
+        "active_exposures": {f: float(v) for f, v in zip(model.factors, active)},
     }

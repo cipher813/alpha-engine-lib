@@ -156,7 +156,7 @@ def time_weighted_return(points: list[ValuationPoint]) -> float | None:
         return None
     pts = sorted(points, key=lambda p: p.when)
     growth = 1.0
-    for begin, end in zip(pts, pts[1:], strict=False):
+    for begin, end in zip(pts, pts[1:]):  # no strict= (3.10+); lib targets 3.9
         invested = begin.value + begin.flow
         if invested <= 0:
             return None
