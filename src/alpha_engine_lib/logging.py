@@ -12,23 +12,33 @@ Modes:
 - JSON: activated by ``ALPHA_ENGINE_JSON_LOGS=1``. Emits one JSON object
   per log record, including tracebacks for errors.
 
-Flow Doctor activates only when ``FLOW_DOCTOR_ENABLED=1`` and a
-``flow_doctor_yaml`` path is provided. ERROR-level records (including
-``logger.exception``) fire the FlowDoctorHandler, which dispatches per
-the yaml config (email + GitHub issue with dedup + rate limits).
+Flow Doctor is **default-on** (since 0.58.0): it activates whenever a
+``flow_doctor_yaml`` path is provided to :func:`setup_logging` — passing a
+yaml IS the opt-in. ``FLOW_DOCTOR_DISABLED=1`` (or ``FLOW_DOCTOR_ENABLED=0``)
+is the kill switch; a test context (``PYTEST_CURRENT_TEST``) auto-disables
+unless ``FLOW_DOCTOR_ALLOW_IN_TESTS=1``. This inverts the prior opt-in-per-
+runtime default, whose failure mode was silently-dark runtimes. ERROR-level
+records (including ``logger.exception``) fire the FlowDoctorHandler, which
+dispatches per the yaml config (email + GitHub issue with dedup + rate
+limits); wrap entrypoints in :func:`guard_entrypoint` / :func:`monitor_handler`
+to also capture uncaught crashes.
 
-Requires the ``flow_doctor`` optional extra when FLOW_DOCTOR_ENABLED=1
-(``alpha-engine-lib[flow_doctor]``).
+In a deployed runtime (Lambda, or ``ALPHA_ENGINE_DEPLOYED=1`` on EC2/SF/spot)
+a missing install / yaml / secret fails loud; in local dev / CI the same
+conditions log a WARNING and skip activation. Requires the ``flow_doctor``
+optional extra (``alpha-engine-lib[flow_doctor]``).
 """
 
 from __future__ import annotations
 
+import contextlib
+import functools
 import json
 import logging
 import os
 import re
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Callable, Optional
 
 # ``${VAR}`` interpolation tokens in a flow-doctor.yaml. flow-doctor
 # resolves these from ``os.environ`` eagerly at ``FlowDoctor.from_config()``
@@ -154,6 +164,58 @@ def get_flow_doctor():
     return _fd_instance
 
 
+@contextlib.contextmanager
+def guard_entrypoint():
+    """Wrap a pipeline entrypoint body so an uncaught crash reaches flow-doctor.
+
+    flow-doctor's logging handler only sees ``logger.error()/exception()``
+    records — a bare ``raise`` that propagates out (the fleet's fail-loud
+    posture) crashes the process *without* a report. Wrapping ``main()`` in
+    this captures that path and re-raises (never swallows). No-ops cleanly when
+    flow-doctor is inactive (local dev / disabled), so it's safe to add
+    unconditionally::
+
+        from alpha_engine_lib.logging import setup_logging, guard_entrypoint
+        setup_logging("executor", flow_doctor_yaml=_FD_YAML)
+        def main():
+            with guard_entrypoint():
+                run_pipeline()
+    """
+    fd = _fd_instance
+    if fd is None:
+        yield
+        return
+    with fd.guard():
+        yield
+
+
+def monitor_handler(func: Callable) -> Callable:
+    """Decorator form of :func:`guard_entrypoint` for Lambda handlers.
+
+    ``fd`` is resolved at call time (not decoration time) so it works when the
+    handler is decorated at import — before ``setup_logging()`` runs — and
+    no-ops when flow-doctor is inactive::
+
+        @monitor_handler
+        def handler(event, context):
+            ...
+    """
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        fd = _fd_instance
+        if fd is None:
+            return func(*args, **kwargs)
+        try:
+            return func(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001 - reported then re-raised
+            try:
+                fd.report(exc)
+            except Exception:
+                pass
+            raise
+    return wrapper
+
+
 def _seed_flow_doctor_secrets(yaml_path: str) -> None:
     """Populate the flow-doctor ``${VAR}`` secrets into ``os.environ``.
 
@@ -206,9 +268,57 @@ def _seed_flow_doctor_secrets(yaml_path: str) -> None:
             os.environ[var] = value
 
 
+def _is_deployed() -> bool:
+    """True when running in a deployed runtime (Lambda or marked EC2/SF/spot).
+
+    Governs flow-doctor's ``strict`` posture: deployed → fail loud on a
+    misconfigured/secret-missing flow-doctor (you WANT that surfaced in
+    prod); not deployed (local dev / CI) → graceful WARN + skip so a
+    developer who never set the secrets isn't blocked.
+
+    ``AWS_LAMBDA_FUNCTION_NAME`` is set automatically by the Lambda
+    runtime (free signal); ``ALPHA_ENGINE_DEPLOYED=1`` is the explicit
+    marker added to EC2 systemd / Step Function / spot env blocks.
+    """
+    return bool(
+        os.environ.get("AWS_LAMBDA_FUNCTION_NAME")
+        or os.environ.get("ALPHA_ENGINE_DEPLOYED") == "1"
+    )
+
+
+def _flow_doctor_should_activate(yaml_path: Optional[str]) -> bool:
+    """Decide whether flow-doctor activates (default-on when a yaml is given).
+
+    Precedence (first match wins):
+    1. ``FLOW_DOCTOR_DISABLED=1`` or ``FLOW_DOCTOR_ENABLED=0`` → off (kill switch).
+    2. ``FLOW_DOCTOR_ENABLED=1`` → on. Explicit opt-in wins even under pytest —
+       preserves the pre-0.58 contract (existing suites that assert activation).
+    3. Test context (``PYTEST_CURRENT_TEST`` set) → off, unless
+       ``FLOW_DOCTOR_ALLOW_IN_TESTS=1``. Guards only the NEW default-on path so a
+       consumer's suite never fires real issues/telegram by merely importing.
+    4. Default (unset): on **iff** a ``flow_doctor_yaml`` was provided — passing
+       a yaml IS the opt-in. This inverts the old opt-in-per-runtime default
+       whose failure mode was silently-dark runtimes (predictor/backtester/
+       research were wired but never exported FLOW_DOCTOR_ENABLED=1).
+    """
+    if os.environ.get("FLOW_DOCTOR_DISABLED", "0") == "1":
+        return False
+    enabled = os.environ.get("FLOW_DOCTOR_ENABLED")
+    if enabled == "0":
+        return False
+    if enabled == "1":
+        return True
+    if os.environ.get("PYTEST_CURRENT_TEST") and (
+        os.environ.get("FLOW_DOCTOR_ALLOW_IN_TESTS", "0") != "1"
+    ):
+        return False
+    return bool(yaml_path)
+
+
 def _attach_flow_doctor(
     yaml_path: str,
     exclude_patterns: list[str] | None = None,
+    strict: bool = True,
 ) -> None:
     """Initialize the shared flow-doctor instance and attach a log handler.
 
@@ -217,21 +327,35 @@ def _attach_flow_doctor(
     rendered message matches any pattern are dropped before entering
     the flow-doctor dispatch pipeline (email / GitHub issue). Use for
     benign ERROR-level noise that would otherwise dedup-spam on-call.
+
+    ``strict`` (deployed runtimes) re-raises a missing-install / missing-yaml
+    / missing-secret as a hard failure — a silently-degraded error monitor
+    defeats the purpose. When not strict (local dev / CI), the same conditions
+    log a WARNING and skip activation so a developer who never configured
+    flow-doctor isn't blocked.
     """
     global _fd_instance
+    _log = logging.getLogger("alpha_engine_lib.logging")
+
     try:
         import flow_doctor
     except ImportError as exc:
-        raise RuntimeError(
-            "FLOW_DOCTOR_ENABLED=1 but flow-doctor is not installed. Install "
-            "via alpha-engine-lib[flow_doctor] or add flow-doctor[diagnosis] "
+        msg = (
+            "flow-doctor is not installed but a flow_doctor_yaml was provided. "
+            "Install via alpha-engine-lib[flow_doctor] or add flow-doctor[diagnosis] "
             f"to requirements: {exc}"
-        ) from exc
+        )
+        if strict:
+            raise RuntimeError(msg) from exc
+        _log.warning("flow-doctor inactive (dev): %s", msg)
+        return
 
     if not os.path.exists(yaml_path):
-        raise RuntimeError(
-            f"FLOW_DOCTOR_ENABLED=1 but flow-doctor config not found at {yaml_path}"
-        )
+        msg = f"flow-doctor config not found at {yaml_path}"
+        if strict:
+            raise RuntimeError(msg)
+        _log.warning("flow-doctor inactive (dev): %s", msg)
+        return
 
     _seed_flow_doctor_secrets(yaml_path)
     # flow-doctor 0.6.0 removed the deprecated ``flow_doctor.init()`` free
@@ -240,10 +364,23 @@ def _attach_flow_doctor(
     # init() on flow-doctor < 0.6 so this works across the soak window
     # regardless of which flow-doctor the consumer has pinned. Drop the
     # fallback once the fleet floor is flow-doctor>=0.6.0.
-    if hasattr(flow_doctor.FlowDoctor, "from_config"):
-        _fd_instance = flow_doctor.FlowDoctor.from_config(config_path=yaml_path)
-    else:
-        _fd_instance = flow_doctor.init(config_path=yaml_path)
+    #
+    # ``strict`` flows into from_config: in prod a missing token raises a
+    # ConfigError (fail loud); in dev FlowDoctor degrades to a no-op (_healthy
+    # = False) with a stderr WARN instead of crashing the developer's run.
+    try:
+        if hasattr(flow_doctor.FlowDoctor, "from_config"):
+            _fd_instance = flow_doctor.FlowDoctor.from_config(
+                config_path=yaml_path, strict=strict
+            )
+        else:
+            _fd_instance = flow_doctor.init(config_path=yaml_path)
+    except Exception as exc:  # noqa: BLE001 - strict re-raise below
+        if strict:
+            raise
+        _log.warning("flow-doctor inactive (dev): construction failed: %s", exc)
+        return
+
     handler_kwargs: dict = {"level": logging.ERROR}
     if exclude_patterns:
         handler_kwargs["exclude_patterns"] = exclude_patterns
@@ -303,10 +440,24 @@ def setup_logging(
     root.addHandler(handler)
     root.setLevel(logging.INFO)
 
-    if os.environ.get("FLOW_DOCTOR_ENABLED", "0") == "1":
-        if not flow_doctor_yaml:
-            raise RuntimeError(
-                "FLOW_DOCTOR_ENABLED=1 but setup_logging() was not given a "
-                "flow_doctor_yaml path"
-            )
-        _attach_flow_doctor(flow_doctor_yaml, exclude_patterns=exclude_patterns)
+    # An explicit FLOW_DOCTOR_ENABLED=1 with no yaml is a misconfiguration the
+    # operator wants surfaced loudly (it can't be silently default-off anymore).
+    if os.environ.get("FLOW_DOCTOR_ENABLED") == "1" and not flow_doctor_yaml:
+        raise RuntimeError(
+            "FLOW_DOCTOR_ENABLED=1 but setup_logging() was not given a "
+            "flow_doctor_yaml path"
+        )
+
+    # Default-on: flow-doctor activates whenever a yaml is provided, unless a
+    # kill switch / test context says otherwise (see _flow_doctor_should_activate).
+    # strict (fail loud on missing install/yaml/secret) applies in a deployed
+    # runtime OR whenever the operator explicitly set FLOW_DOCTOR_ENABLED=1 — an
+    # explicit opt-in wants its misconfig surfaced. The default-on path in local
+    # dev / CI stays lenient (WARN + skip) so it never blocks a developer.
+    if flow_doctor_yaml and _flow_doctor_should_activate(flow_doctor_yaml):
+        strict = _is_deployed() or os.environ.get("FLOW_DOCTOR_ENABLED") == "1"
+        _attach_flow_doctor(
+            flow_doctor_yaml,
+            exclude_patterns=exclude_patterns,
+            strict=strict,
+        )

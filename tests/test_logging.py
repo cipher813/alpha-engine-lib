@@ -156,7 +156,11 @@ def test_flow_doctor_enabled_happy_path(monkeypatch, tmp_path):
         setup_logging("test", flow_doctor_yaml=str(yaml_path))
 
     assert get_flow_doctor() is fake_instance
-    fake_module.FlowDoctor.from_config.assert_called_once_with(config_path=str(yaml_path))
+    # 0.58.0: from_config receives strict= (True here — FLOW_DOCTOR_ENABLED=1 is
+    # an explicit opt-in, so a misconfig should fail loud).
+    fake_module.FlowDoctor.from_config.assert_called_once_with(
+        config_path=str(yaml_path), strict=True
+    )
     # No exclude_patterns passed → kwarg must be absent so we don't
     # silently override the FlowDoctorHandler default.
     _, kwargs = fake_module.FlowDoctorHandler.call_args
@@ -358,7 +362,7 @@ def test_seed_runs_before_flow_doctor_init(
 
     env_at_init: dict[str, str] = {}
 
-    def capturing_from_config(*, config_path):
+    def capturing_from_config(*, config_path, strict=True):
         env_at_init.update({v: os.environ.get(v) for v in _FD_VARS})
         return mock.Mock()
 
