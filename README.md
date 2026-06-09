@@ -47,7 +47,8 @@ setup_logging("data-collector", flow_doctor_yaml="/path/to/flow-doctor.yaml")
 ```
 
 - Text mode by default; JSON via `ALPHA_ENGINE_JSON_LOGS=1`
-- Flow-doctor attaches as an ERROR-level handler when `FLOW_DOCTOR_ENABLED=1` (requires `[flow_doctor]` extra)
+- **Flow-doctor is default-on (0.58.0+):** it attaches an ERROR-level handler whenever a `flow_doctor_yaml` is provided (requires `[flow_doctor]` extra). `FLOW_DOCTOR_DISABLED=1` is the kill switch; test runs auto-disable unless `FLOW_DOCTOR_ALLOW_IN_TESTS=1`. Deployed runtimes (Lambda, or `ALPHA_ENGINE_DEPLOYED=1`) fail loud on misconfig; local dev/CI logs a WARNING and skips.
+- Wrap an entrypoint in `guard_entrypoint()` (context manager) or `@monitor_handler` (Lambda decorator) so an uncaught `raise` is also captured — not just `logger.error()` records. Both no-op when flow-doctor is inactive.
 
 ### `preflight` — fail-fast connectivity + freshness checks
 
