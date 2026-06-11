@@ -1,0 +1,148 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nousergon.ai/schemas/alpha-engine/signals.v1.json",
+  "title": "Alpha Engine Signals (Slot R contract, v1)",
+  "description": "Research-slot output contract: written weekly by the research orchestration slot to signals/{date}/signals.json and signals/latest.json; consumed by executor (actionable buckets + sizing inputs), predictor (research-context META_FEATURES), backtester (simulation), dashboard (display). v1 codifies the shape pinned by test_signals_producer_contract.py (research, 2026-06-10) and the consumer-reliance audit of 2026-06-11 (config#638 / M0). Evolution is ADDITIVE-ONLY per the S3 Contract Safety rule: new optional fields may appear at any time (additionalProperties stays true); removing or renaming a required field is a breaking change requiring a v2 schema + dual-write window.",
+  "type": "object",
+  "required": [
+    "date",
+    "market_regime",
+    "sector_ratings",
+    "sector_modifiers",
+    "universe",
+    "buy_candidates"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Contract version stamp (optional in v1 artifacts for backward compatibility; producers should begin emitting it)"
+    },
+    "date": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+      "description": "Run date (YYYY-MM-DD)"
+    },
+    "run_date": {
+      "type": "string",
+      "description": "Dual-track run/trading-day date per DATE_CONVENTIONS.md"
+    },
+    "time": {
+      "type": "string",
+      "description": "Time of run (HH:MM:SS)"
+    },
+    "run_time": {
+      "type": "string",
+      "description": "Time of run (HH:MM:SS, legacy alias)"
+    },
+    "architecture_version": {
+      "type": "string",
+      "description": "Research architecture version (e.g. sector_teams)"
+    },
+    "market_regime": {
+      "type": "string",
+      "enum": ["bull", "neutral", "bear"],
+      "description": "3-class Ang-Bekaert regime taxonomy (v0.42.0 / 2026-05-28). Legacy 4-class 'caution' retired; historical artifacts carrying 'caution' are grandfathered on READ by tolerant consumers but are NOT valid against this write-contract."
+    },
+    "sector_ratings": {
+      "type": "object",
+      "description": "Per-sector {rating: overweight|market_weight|underweight, modifier: float, rationale: string}; executor sizing input"
+    },
+    "sector_modifiers": {
+      "type": "object",
+      "additionalProperties": { "type": "number" },
+      "description": "Per-sector score modifiers (~0.7-1.3); predictor sector_macro_modifier META_FEATURE input"
+    },
+    "universe": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/signal_entry" },
+      "description": "Full tracked population with per-ticker signals; executor + predictor + backtester read this"
+    },
+    "buy_candidates": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/signal_entry" },
+      "description": "Stocks promoted to buy consideration; executor entry pipeline reads this"
+    },
+    "population": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Current population roster (tickers)"
+    },
+    "signals": {
+      "type": "object",
+      "description": "Legacy v2 per-ticker dict format (deprecated; retained for backward compatibility)"
+    }
+  },
+  "$defs": {
+    "signal_entry": {
+      "type": "object",
+      "required": [
+        "ticker",
+        "signal",
+        "score",
+        "rating",
+        "conviction",
+        "sector",
+        "sector_rating",
+        "price_target_upside"
+      ],
+      "properties": {
+        "ticker": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Stock ticker symbol"
+        },
+        "signal": {
+          "type": "string",
+          "enum": ["ENTER", "EXIT", "REDUCE", "HOLD"],
+          "description": "Trading signal; executor buckets on this"
+        },
+        "score": {
+          "type": ["number", "null"],
+          "minimum": 0,
+          "maximum": 100,
+          "description": "Composite attractiveness score (0-100). null tolerated, but producer downgrades ENTER+null to HOLD (2026-04-04 incident guard); predictor drops rows with null score"
+        },
+        "rating": {
+          "type": "string",
+          "enum": ["BUY", "HOLD", "SELL"],
+          "description": "Long-term rating"
+        },
+        "conviction": {
+          "type": "string",
+          "enum": ["rising", "stable", "declining"],
+          "description": "Score trend; executor derates declining to 0.7x size; predictor research_conviction feature"
+        },
+        "sector": {
+          "type": "string",
+          "description": "GICS sector name; predictor canonicalizes (Health Care->Healthcare etc.) for sector_modifiers lookup"
+        },
+        "sector_rating": {
+          "type": "string",
+          "enum": ["overweight", "market_weight", "underweight"],
+          "description": "Sector-level rating; executor exposure tracking"
+        },
+        "price_target_upside": {
+          "type": ["number", "null"],
+          "description": "Estimated upside to price target (decimal, 0.18 = 18%); executor position-target sizing"
+        },
+        "thesis_summary": {
+          "type": ["string", "null"],
+          "description": "One-paragraph investment thesis (display/enrichment)"
+        },
+        "sub_scores": {
+          "type": "object",
+          "properties": {
+            "quant": { "type": ["number", "null"] },
+            "qual": { "type": ["number", "null"] }
+          },
+          "description": "Quantitative and qualitative sub-scores"
+        },
+        "factor_quality_score": {
+          "type": ["number", "null"],
+          "description": "Factor-quality percentile (attractiveness-pillars Phase 4, optional)"
+        }
+      }
+    }
+  }
+}
